@@ -40,9 +40,10 @@ Layout (approximate):
 
 import sys, os, json, time, subprocess, signal, re
 from pathlib import Path
+from decimal import Decimal, getcontext
 from datetime import datetime, timedelta
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QFont, QTextCursor, QAction
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -59,6 +60,14 @@ SCANNER_SCRIPT_DEFAULT = "zeta_gpu_scan_v6_hp.py"
 STATUS_TAG = "@@STATUS@@ "                # must match _STATUS_TAG in scanner
 LIVE_OUTPUT_MAX_LINES = 10_000            # scrollback cap in the text pane
 PAUSE_FLAG_NAME = "pause.flag"            # created/deleted in cwd
+
+# QSettings identity. On Windows these become the registry path
+# HKCU\Software\SetiAstro\ZetaSweepUI. On macOS a plist in ~/Library/
+# Preferences. On Linux an ini under ~/.config/SetiAstro/. Kept as
+# module-level so `main()` can set them on QApplication before any
+# QSettings() constructor runs.
+SETTINGS_ORG = "SetiAstro"
+SETTINGS_APP = "ZetaSweepUI"
 
 
 # --------------------------------------------------------------------------
@@ -125,7 +134,11 @@ class ScannerUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Riemann-Siegel Zero Scanner")
-        self.resize(1100, 800)
+        # Wider default now that layout is horizontal: left column ~480px
+        # of status widgets, rest for the terminal. User can drag the
+        # splitter to reallocate. Window+splitter geometry persist across
+        # launches via QSettings.
+        self.resize(1400, 780)
 
         self.state = self.STATE_IDLE
         self.proc = None
@@ -139,6 +152,10 @@ class ScannerUI(QMainWindow):
         self.last_wall = 0.0
 
         self._build_ui()
+        # Restore any config the user saved in a previous session BEFORE
+        # setting state (state affects widget-enabled state, which is fine
+        # to compute after values are populated).
+        self._load_settings()
         self._set_state(self.STATE_IDLE)
 
         # Elapsed-time ticker (updates the elapsed/ETA labels once a second
@@ -153,7 +170,38 @@ class ScannerUI(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+
+        # Top-level: a HORIZONTAL splitter. Left pane = all the status
+        # widgets stacked vertically (config, buttons, progress, stats,
+        # tightest pair). Right pane = the live output terminal.
+        #
+        # Why a splitter and not a fixed HBoxLayout: users have different
+        # monitor widths and preferences. Splitter lets them drag the divider
+        # to give more space to output vs status. Position is persisted via
+        # QSettings so it's restored across launches.
+        #
+        # Vertical growth (config panel getting tall) becomes horizontal
+        # (config panel and output pane share the width), so the whole UI
+        # scales gracefully as more config fields get added over time.
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Wrap the splitter in a top-level VBox on the central widget --
+        # gives it proper edge margins and lets the status bar sit beneath.
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.addWidget(self.main_splitter)
+
+        # Left column: status widgets stacked vertically
+        left_widget = QWidget()
+        left_col = QVBoxLayout(left_widget)
+        left_col.setContentsMargins(0, 0, 0, 0)
+        self.main_splitter.addWidget(left_widget)
+
+        # We build all the status groups into `left_col` (was `root` before).
+        # The output group at the very end is added to the SPLITTER, not to
+        # left_col, so it becomes the right pane.
+        root = left_col   # local alias so the existing addWidget() calls
+                          # below keep working without a mass rename
 
         # --- Configuration group ---
         # Each config row has an "override" checkbox on the right so the user
@@ -240,6 +288,16 @@ class ScannerUI(QMainWindow):
         self.prefix_override = QCheckBox("Override")
         cfg.addWidget(self.prefix_override, 6, 2)
 
+        # Row 7: reset-to-defaults button. Wipes saved QSettings and reloads
+        # the coded defaults into every field. Useful if the saved config
+        # gets into a weird state or the user wants a clean slate.
+        self.btn_reset_cfg = QPushButton("Reset config to defaults")
+        self.btn_reset_cfg.setToolTip(
+            "Clear all saved settings and restore the built-in defaults. "
+            "Does not affect the running scanner or any output files.")
+        self.btn_reset_cfg.clicked.connect(self._reset_settings)
+        cfg.addWidget(self.btn_reset_cfg, 7, 0, 1, 4)
+
         root.addWidget(cfg_group)
 
         # --- Button row ---
@@ -317,25 +375,74 @@ class ScannerUI(QMainWindow):
         # --- Tightest pair leaderboard entry ---
         tp_group = QGroupBox("Tightest pair")
         tp = QGridLayout(tp_group)
-        tp.addWidget(QLabel("t:"), 0, 0)
+
+        # Three t-values stacked with matching-digit alignment so you can SEE
+        # how tight the pair is at a glance. Fixed-width font, same field
+        # width, same fractional precision. The extremum is in the middle
+        # because that's the parabolic vertex sitting between the two zeros.
+        # Left and right zeros are reconstructed as extremum +/- gap/2 in
+        # DECIMAL arithmetic -- naive float64 subtraction at t~1e13 quantizes
+        # both to the same ULP and would misreport the gap by ~50%.
+        _tp_fixed = QFont("Consolas", 10)
+
+        tp.addWidget(QLabel("t (left zero):"), 0, 0)
+        self.tp_t_left_label = QLabel("—")
+        self.tp_t_left_label.setFont(_tp_fixed)
+        self.tp_t_left_label.setToolTip(
+            "Location of the LEFT zero of the tight pair, reconstructed as "
+            "t_extremum - gap/2 in decimal arithmetic (float64 can't "
+            "distinguish the two zeros at heights >= 1e13, so we use Decimal "
+            "to preserve the sub-ULP difference for display).")
+        tp.addWidget(self.tp_t_left_label, 0, 1, 1, 3)
+
+        tp.addWidget(QLabel("t (extremum):"), 1, 0)
         self.tp_t_label = QLabel("—")
-        self.tp_t_label.setFont(QFont("Consolas", 10))
-        tp.addWidget(self.tp_t_label, 0, 1, 1, 3)
-        tp.addWidget(QLabel("norm_gap:"), 1, 0)
+        self.tp_t_label.setFont(_tp_fixed)
+        self.tp_t_label.setToolTip(
+            "Location of the parabolic-vertex extremum BETWEEN the two zeros "
+            "of the tight pair. This is what the scanner stores as the hit's "
+            "'t'; the two bracketing zero locations are derived from it.")
+        tp.addWidget(self.tp_t_label, 1, 1, 1, 3)
+
+        tp.addWidget(QLabel("t (right zero):"), 2, 0)
+        self.tp_t_right_label = QLabel("—")
+        self.tp_t_right_label.setFont(_tp_fixed)
+        self.tp_t_right_label.setToolTip(
+            "Location of the RIGHT zero of the tight pair, reconstructed as "
+            "t_extremum + gap/2 in decimal arithmetic.")
+        tp.addWidget(self.tp_t_right_label, 2, 1, 1, 3)
+
+        tp.addWidget(QLabel("zero index (left):"), 3, 0)
+        self.tp_zi_label = QLabel("—")
+        self.tp_zi_label.setFont(_tp_fixed)
+        self.tp_zi_label.setToolTip(
+            "Ordinal index of the LEFT zero of the tight pair. The right "
+            "zero's index is one more. This is the standard way of "
+            "referring to a Riemann zeta zero in the literature "
+            "(e.g. 'the 10^13-th zero').")
+        tp.addWidget(self.tp_zi_label, 3, 1, 1, 3)
+
+        tp.addWidget(QLabel("norm_gap:"), 4, 0)
         self.tp_ngap_label = QLabel("—")
-        tp.addWidget(self.tp_ngap_label, 1, 1)
-        tp.addWidget(QLabel("gap:"), 1, 2)
+        tp.addWidget(self.tp_ngap_label, 4, 1)
+        tp.addWidget(QLabel("gap:"), 4, 2)
         self.tp_gap_label = QLabel("—")
-        tp.addWidget(self.tp_gap_label, 1, 3)
-        tp.addWidget(QLabel("Z at extremum:"), 2, 0)
+        tp.addWidget(self.tp_gap_label, 4, 3)
+        tp.addWidget(QLabel("Z at extremum:"), 5, 0)
         self.tp_z_label = QLabel("—")
-        tp.addWidget(self.tp_z_label, 2, 1)
-        tp.addWidget(QLabel("kind:"), 2, 2)
+        tp.addWidget(self.tp_z_label, 5, 1)
+        tp.addWidget(QLabel("kind:"), 5, 2)
         self.tp_kind_label = QLabel("—")
-        tp.addWidget(self.tp_kind_label, 2, 3)
+        tp.addWidget(self.tp_kind_label, 5, 3)
         root.addWidget(tp_group)
 
-        # --- Live output pane ---
+        # Trailing stretch pushes all left-column widgets to the top when the
+        # splitter pane is taller than their combined natural height. Without
+        # this, Qt would distribute empty vertical space between the groups
+        # (making them look awkwardly spread out on a tall window).
+        root.addStretch(1)
+
+        # --- Live output pane (RIGHT COLUMN of the horizontal splitter) ---
         out_group = QGroupBox("Live output")
         out_v = QVBoxLayout(out_group)
         self.output = QTextEdit()
@@ -353,7 +460,20 @@ class ScannerUI(QMainWindow):
         out_btns.addStretch(1)
         out_btns.addWidget(clear_btn)
         out_v.addLayout(out_btns)
-        root.addWidget(out_group, stretch=1)
+
+        # Add to the RIGHT side of the horizontal splitter (not to left_col).
+        # Stretch factors: left column stays compact (0), right column grows
+        # to fill horizontal space (1). User can drag the divider to override.
+        self.main_splitter.addWidget(out_group)
+        self.main_splitter.setStretchFactor(0, 0)   # left: content-sized
+        self.main_splitter.setStretchFactor(1, 1)   # right: expandable
+        # Sensible initial split (left ~480px, rest to output) -- overridden
+        # by any saved splitter state in _load_settings.
+        self.main_splitter.setSizes([480, 700])
+
+        # Also give the left column a minimum width so it doesn't get
+        # crushed to nothing by an aggressive drag on the divider.
+        left_widget.setMinimumWidth(400)
 
         # --- Status bar ---
         self.setStatusBar(QStatusBar())
@@ -412,6 +532,7 @@ class ScannerUI(QMainWindow):
         self.startchunk_override.setEnabled(cfg_editable)
         self.prefix_edit.setEnabled(cfg_editable)
         self.prefix_override.setEnabled(cfg_editable)
+        self.btn_reset_cfg.setEnabled(cfg_editable)
 
     # ------------------------- Start / Pause / Resume / Abort -------------------------
     def _spawn_scanner(self):
@@ -520,6 +641,10 @@ class ScannerUI(QMainWindow):
     def _on_start(self):
         if self.state != self.STATE_IDLE:
             return
+        # Persist the config used to launch this run, so next launch of the
+        # UI restores the same setup automatically. Done BEFORE spawn so the
+        # config is saved even if spawn fails for some reason.
+        self._save_settings()
         self._spawn_scanner()
 
     def _on_pause(self):
@@ -608,14 +733,7 @@ class ScannerUI(QMainWindow):
             self.zshort_label.setText(str(event.get('zeros_short_resume', 0)))
             self.viol_label.setText(str(event.get('violations_resume', 0)))
             self.chunk_label.setText(f"{self.first_chunk_this_run} (resuming)")
-            tp = event.get("tightest_resume")
-            if tp:
-                self.tp_t_label.setText(f"{tp.get('t', 0):.6f}")
-                self.tp_ngap_label.setText(f"{tp.get('norm_gap', 0):.5f}")
-                gap = tp.get('gap')
-                self.tp_gap_label.setText(f"{gap:.6e}" if gap else "—")
-                self.tp_z_label.setText(f"{tp.get('z', 0):+.3e}")
-                self.tp_kind_label.setText(tp.get('kind', '—'))
+            self._update_tightest_pair(event.get("tightest_resume"))
             self.statusBar().showMessage(
                 f"Run start: T_BASE={event.get('t_base')}, "
                 f"chunks {self.first_chunk_this_run}..{self.total_chunks_target}")
@@ -635,15 +753,7 @@ class ScannerUI(QMainWindow):
             self.zloc_label.setText(f"{event.get('zeros_located_total', 0):,}")
             self.zreq_label.setText(f"{event.get('zeros_required_total', 0):,}")
             self.zshort_label.setText(str(event.get("zeros_short_total", 0)))
-
-            tp = event.get("tightest")
-            if tp:
-                self.tp_t_label.setText(f"{tp.get('t', 0):.6f}")
-                self.tp_ngap_label.setText(f"{tp.get('norm_gap', 0):.5f}")
-                gap = tp.get('gap')
-                self.tp_gap_label.setText(f"{gap:.6e}" if gap else "—")
-                self.tp_z_label.setText(f"{tp.get('z', 0):+.3e}")
-                self.tp_kind_label.setText(tp.get('kind', '—'))
+            self._update_tightest_pair(event.get("tightest"))
 
         elif kind == "violation_survived":
             # Update violation counter and pop a modal -- this is a huge deal
@@ -689,6 +799,79 @@ class ScannerUI(QMainWindow):
         self.proc = None
         # Reader thread will finish on its own; nothing to clean up here.
 
+    def _update_tightest_pair(self, tp):
+        """Populate the tightest-pair widget from a dict payload. Called on
+        both run_start (tightest_resume field) and chunk_end (tightest field).
+        Both payloads share the same shape: t, z, kind, gap, norm_gap, and --
+        for post-index scans -- zero_index. Older resumed checkpoints won't
+        have zero_index; we show '—' for those, still correctly showing all
+        the other fields.
+
+        The three t values (left zero / extremum / right zero) are displayed
+        with matching-digit alignment so the tightness is visually obvious.
+        Left and right are computed as extremum +/- gap/2 using DECIMAL
+        arithmetic: at 1e13, float64's ULP is ~2e-3, so naive float
+        subtraction of gap/2 (~1e-3) would either quantize to zero (both
+        zeros displayed identically) or to the wrong ULP (misreporting the
+        difference by ~50%). Decimal preserves the full precision the gap
+        was measured to (~1e-11), anchored to the extremum's storage value.
+        """
+        if not tp:
+            return
+        t_ext = tp.get('t', 0)
+        gap = tp.get('gap')
+
+        # Format the three t values with matched precision so they align
+        # visually. We use 10 fractional digits -- enough to show the
+        # sub-thousandths difference for even tighter pairs than the
+        # current 0.01 norm_gap record.
+        T_FMT_DIGITS = 10
+        try:
+            t_ext_str = f"{t_ext:.{T_FMT_DIGITS}f}"
+        except (TypeError, ValueError):
+            t_ext_str = str(t_ext)
+        self.tp_t_label.setText(t_ext_str)
+
+        if gap is not None and gap > 0:
+            # Set Decimal precision high enough that the digit-level
+            # subtraction doesn't lose accuracy. 30 significant digits is
+            # comfortably more than we display.
+            getcontext().prec = 40
+            try:
+                d_ext = Decimal(repr(float(t_ext)))
+                d_half = Decimal(repr(float(gap))) / Decimal(2)
+                d_left = d_ext - d_half
+                d_right = d_ext + d_half
+                # Format both with the same total width so digits line up
+                # under the extremum row
+                left_str  = f"{d_left:.{T_FMT_DIGITS}f}"
+                right_str = f"{d_right:.{T_FMT_DIGITS}f}"
+                self.tp_t_left_label.setText(left_str)
+                self.tp_t_right_label.setText(right_str)
+            except Exception:
+                self.tp_t_left_label.setText("—")
+                self.tp_t_right_label.setText("—")
+        else:
+            # No precise gap available (rare edge case) -- can't split
+            self.tp_t_left_label.setText("(no precise gap)")
+            self.tp_t_right_label.setText("(no precise gap)")
+
+        self.tp_ngap_label.setText(f"{tp.get('norm_gap', 0):.5f}")
+        self.tp_gap_label.setText(f"{gap:.6e}" if gap else "—")
+        self.tp_z_label.setText(f"{tp.get('z', 0):+.3e}")
+        self.tp_kind_label.setText(tp.get('kind', '—'))
+        zi = tp.get('zero_index')
+        if zi is not None:
+            # Show "#N (right: N+1)" so it's clear the ordinal names the LEFT
+            # zero of the pair and the tight pair is between #N and #N+1.
+            try:
+                zi_int = int(zi)
+                self.tp_zi_label.setText(f"#{zi_int:,} (right: #{zi_int+1:,})")
+            except (TypeError, ValueError):
+                self.tp_zi_label.setText(str(zi))
+        else:
+            self.tp_zi_label.setText("—")
+
     # ------------------------- Elapsed / ETA ticker -------------------------
     def _update_elapsed(self):
         if self.run_start_time is None or self.state == self.STATE_IDLE:
@@ -712,8 +895,112 @@ class ScannerUI(QMainWindow):
         else:
             self.eta_label.setText("—")
 
+    # ------------------------- Settings persistence -------------------------
+    # Config values persist across runs via QSettings -- on Windows this uses
+    # the registry (HKCU\Software\SetiAstro\ZetaSweepUI), on macOS a plist
+    # file, on Linux an ini file. No manual paths, no config-file bookkeeping.
+    # Called on __init__ (load) and closeEvent + Start (save), so a user who
+    # sets up 200-chunk overrides once never has to re-type them.
+    #
+    # Not persisted: anything derived from a running scanner (state, elapsed
+    # time, PID, live output pane -- those are per-run, not per-config).
+
+    def _load_settings(self):
+        """Restore config field values from persistent storage. Silently
+        skips any missing keys, which is what you want on the first launch
+        (all fields keep their code-level defaults)."""
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        # Text fields
+        self.script_edit.setText(
+            s.value("script_path", SCANNER_SCRIPT_DEFAULT, type=str))
+        self.cwd_edit.setText(
+            s.value("working_dir", os.getcwd(), type=str))
+        self.flag_edit.setText(
+            s.value("pause_flag", PAUSE_FLAG_NAME, type=str))
+        self.tbase_edit.setText(
+            s.value("tbase_text", "1e13", type=str))
+        self.prefix_edit.setText(
+            s.value("output_prefix", "", type=str))
+        # Numeric fields
+        self.nchunks_edit.setValue(int(s.value("nchunks", 100, type=int)))
+        self.startchunk_edit.setValue(int(s.value("startchunk", 0, type=int)))
+        # Checkboxes -- QSettings stores bools as strings on some backends
+        # (Windows registry uses "true"/"false"), so coerce via a helper.
+        def _as_bool(v, default=False):
+            if isinstance(v, bool): return v
+            if v is None: return default
+            return str(v).lower() in ("true", "1", "yes")
+        self.tbase_override.setChecked(_as_bool(s.value("tbase_override")))
+        self.nchunks_override.setChecked(_as_bool(s.value("nchunks_override")))
+        self.startchunk_override.setChecked(_as_bool(s.value("startchunk_override")))
+        self.prefix_override.setChecked(_as_bool(s.value("prefix_override")))
+        # Layout geometry: window size/position and splitter divider location.
+        # Qt gives us QByteArray blobs for these; restoreGeometry/restoreState
+        # handle any format quirks and no-op cleanly on missing keys.
+        geom = s.value("window_geometry")
+        if geom is not None:
+            self.restoreGeometry(geom)
+        split = s.value("splitter_state")
+        if split is not None:
+            self.main_splitter.restoreState(split)
+
+    def _save_settings(self):
+        """Persist the current config field values. Called on close and when
+        Start is clicked (so a config used to launch a run is saved even if
+        the user never closes the window)."""
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s.setValue("script_path", self.script_edit.text())
+        s.setValue("working_dir", self.cwd_edit.text())
+        s.setValue("pause_flag", self.flag_edit.text())
+        s.setValue("tbase_text", self.tbase_edit.text())
+        s.setValue("output_prefix", self.prefix_edit.text())
+        s.setValue("nchunks", self.nchunks_edit.value())
+        s.setValue("startchunk", self.startchunk_edit.value())
+        s.setValue("tbase_override", self.tbase_override.isChecked())
+        s.setValue("nchunks_override", self.nchunks_override.isChecked())
+        s.setValue("startchunk_override", self.startchunk_override.isChecked())
+        s.setValue("prefix_override", self.prefix_override.isChecked())
+        # Layout geometry (see _load_settings)
+        s.setValue("window_geometry", self.saveGeometry())
+        s.setValue("splitter_state", self.main_splitter.saveState())
+        s.sync()   # flush to backend immediately
+
+    def _reset_settings(self):
+        """Wipe all saved settings and reload the coded defaults into the
+        UI. Confirmation dialog first -- this is a destructive action."""
+        r = QMessageBox.question(
+            self, "Reset saved configuration?",
+            "Clear all saved config (T_BASE, N_CHUNKS, paths, override "
+            "checkboxes, etc.) and restore the built-in defaults?\n\n"
+            "The running scanner (if any) is not affected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s.clear()
+        s.sync()
+        # Push defaults back into the widgets
+        self.script_edit.setText(SCANNER_SCRIPT_DEFAULT)
+        self.cwd_edit.setText(os.getcwd())
+        self.flag_edit.setText(PAUSE_FLAG_NAME)
+        self.tbase_edit.setText("1e13")
+        self.prefix_edit.setText("")
+        self.nchunks_edit.setValue(100)
+        self.startchunk_edit.setValue(0)
+        self.tbase_override.setChecked(False)
+        self.nchunks_override.setChecked(False)
+        self.startchunk_override.setChecked(False)
+        self.prefix_override.setChecked(False)
+        # Restore default window size and splitter divider position
+        self.resize(1400, 780)
+        self.main_splitter.setSizes([480, 700])
+        self.statusBar().showMessage("Configuration reset to defaults.")
+
     # ------------------------- Shutdown safety -------------------------
     def closeEvent(self, event):
+        # Always persist config on close, even if the user is aborting a
+        # running scanner -- their config choices should survive.
+        self._save_settings()
         if self.state in (self.STATE_RUNNING, self.STATE_PAUSING):
             r = QMessageBox.question(
                 self, "Scanner still running",
@@ -740,6 +1027,11 @@ class ScannerUI(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")   # cleaner cross-platform look
+    # QSettings uses these to pick a per-user storage location automatically.
+    # Setting them here means we never have to pass them to QSettings() --
+    # every QSettings() constructor picks them up implicitly.
+    app.setOrganizationName(SETTINGS_ORG)
+    app.setApplicationName(SETTINGS_APP)
     win = ScannerUI()
     win.show()
     sys.exit(app.exec())

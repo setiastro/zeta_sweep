@@ -870,7 +870,7 @@ def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None):
             print(f"    [ext] candidates={_n_candidates} verify={_n_verify} "
                   f"precise_gap={_n_precise} hits={_n_hits}", flush=True)
 
-    return hits, violations, found, required, refined, dt_b, nz_tb, dt_arr, Z
+    return hits, violations, found, required, refined, dt_b, nz_tb, dt_arr, Z, nz_ta
 
 # ---------------- checkpoint io ----------------
 def load_ckpt():
@@ -896,14 +896,22 @@ def save_ckpt(s):
 def append_hits(hits):
     new = not os.path.exists(RESULTS_LOG)
     with open(RESULTS_LOG,'a') as f:
-        if new: f.write("t,Z_mpmath,kind,gap,norm_gap\n")
-        for t,z,kind,gap,ngap in hits:
-            g=f"{gap:.8e}" if gap is not None else ""
-            ng=f"{ngap:.6f}" if ngap is not None else ""
-            f.write(f"{t:.10f},{z:.12e},{kind},{g},{ng}\n")
+        if new: f.write("t,Z_mpmath,kind,gap,norm_gap,zero_index\n")
+        for h in hits:
+            # Accept both new 6-tuples and legacy 5-tuples so this doesn't
+            # break if some path forgets to enrich (or if resume replays
+            # old-format entries)
+            if len(h) >= 6:
+                t, z, kind, gap, ngap, zi = h[0], h[1], h[2], h[3], h[4], h[5]
+            else:
+                t, z, kind, gap, ngap = h; zi = None
+            g  = f"{gap:.8e}" if gap is not None else ""
+            ng = f"{ngap:.6f}" if ngap is not None else ""
+            zs = str(zi) if zi is not None else ""
+            f.write(f"{t:.10f},{z:.12e},{kind},{g},{ng},{zs}\n")
 
 
-def append_zeros(t0_str, dt_arr, Z, chunk_idx):
+def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
     """
     Extract and log every zero located in this chunk.
 
@@ -923,6 +931,20 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx):
     identifiable after the fact (small |Z_left| and |Z_right| together = a
     pair the sweep resolved with margin; their signs and magnitudes let you
     reconstruct which zeros were the Lehmer-like near-misses).
+
+    `baseline_index` is the ordinal index of the LAST zero BEFORE this chunk's
+    first zero -- i.e. nzeros(t_a) where t_a is the chunk's safe_boundary_a.
+    The scanner already computes this as `nz_ta` per chunk (for the
+    completeness check), so passing it here is essentially free. The first
+    zero in the chunk gets ordinal (baseline_index + 1), the second
+    (baseline_index + 2), and so on. This makes every row's `zero_index`
+    the TRUE ordinal position in the Riemann zeta zero sequence -- the
+    field's standard way of referring to a zero. If baseline_index is None
+    (backward-compatible with older callers), the zero_index column is
+    written as an empty string.
+
+    Returns the number of zeros written, so the caller can accumulate the
+    running baseline for the next chunk (or verify it against nz_seam).
     """
     # find sign-change indices (vectorized, fast)
     sc = (Z[:-1] >= 0) != (Z[1:] >= 0)
@@ -948,11 +970,15 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx):
     new = not os.path.exists(ZEROS_LOG)
     with open(ZEROS_LOG, 'a') as f:
         if new:
-            f.write("t,Z_left,Z_right,dt_left,dt_right,chunk\n")
+            f.write("t,Z_left,Z_right,dt_left,dt_right,chunk,zero_index\n")
         for k, i in enumerate(idx):
             t_abs = float(t0_mpf + mpf(repr(float(dt_zero[k]))))
+            if baseline_index is not None:
+                zi = str(baseline_index + 1 + k)
+            else:
+                zi = ""
             f.write(f"{t_abs:.10f},{Z[i]:+.6e},{Z[i+1]:+.6e},"
-                    f"{dt_arr[i]:.6f},{dt_arr[i+1]:.6f},{chunk_idx}\n")
+                    f"{dt_arr[i]:.6f},{dt_arr[i+1]:.6f},{chunk_idx},{zi}\n")
     return len(idx)
 
 # ---------------- main ----------------
@@ -1080,9 +1106,14 @@ if __name__ == '__main__':
     # which at 1e13 can be 6+ minutes.
     _resume_tightest = None
     if tg:
-        _t, _z, _kind, _gap, _ngap = tg[0]
+        # Support both new 6-wide entries and legacy 5-wide entries from
+        # pre-index checkpoints. Old entries have zero_index = None.
+        _row = tg[0]
+        _t, _z, _kind, _gap, _ngap = _row[0], _row[1], _row[2], _row[3], _row[4]
+        _zi = _row[5] if len(_row) >= 6 else None
         _resume_tightest = {"t": _t, "z": _z, "kind": _kind,
-                            "gap": _gap, "norm_gap": _ngap}
+                            "gap": _gap, "norm_gap": _ngap,
+                            "zero_index": _zi}
     _emit_status("run_start",
         t_base=T_BASE, chunk_t=CHUNK_T, n_chunks=N_CHUNKS, step=STEP,
         start_chunk=sc, checkpoint=CHECKPOINT,
@@ -1123,7 +1154,7 @@ if __name__ == '__main__':
             wall0=time.time()
 
             with T.time("main.process_chunk"):
-                hits,viols,found,required,refined,seam,nz_seam,dt_final,Z_final = process_chunk(
+                hits,viols,found,required,refined,seam,nz_seam,dt_final,Z_final,nz_ta_used = process_chunk(
                     t0_str, dt_start, dt_end, STEP, pool,
                     dt_a=prev_seam, nz_ta=prev_nz)
 
@@ -1137,7 +1168,36 @@ if __name__ == '__main__':
 
             # Log every zero located in this chunk. Every t > 3e12 is past the
             # continuously-verified frontier, so this catalog IS the science.
-            append_zeros(t0_str, dt_final, Z_final, c)
+            # baseline_index = nzeros(t_a) tells append_zeros the ordinal of the
+            # last zero BEFORE this chunk's first zero; each row gets its true
+            # index in the Riemann zeta zero sequence (baseline + 1, +2, ...).
+            append_zeros(t0_str, dt_final, Z_final, c, baseline_index=nz_ta_used)
+
+            # Enrich each hit with its zero_index. A near-miss extremum sits
+            # BETWEEN two consecutive zeros; the "index" we record is the
+            # ordinal of the LEFT zero of the pair (so its right neighbor is
+            # zero_index+1). We compute this cheaply by counting sign changes
+            # in Z_final that occur before the extremum's dt position.
+            if hits and nz_ta_used is not None:
+                # Positions of all sign changes in the (possibly refined) grid
+                sc_mask = (Z_final[:-1] >= 0) != (Z_final[1:] >= 0)
+                sc_dt = dt_final[:-1][sc_mask]   # dt of left-of-sign-change sample
+                enriched = []
+                for h in hits:
+                    t_ext = h[0]
+                    # h[0] is absolute t; convert to dt for this chunk
+                    dt_ext = t_ext - float(mpf(t0_str))
+                    n_before = int(np.searchsorted(sc_dt, dt_ext, side='right'))
+                    # The extremum sits after `n_before` sign-changes-so-far,
+                    # so the left zero of the bracketing pair has ordinal
+                    # nz_ta + n_before (that's the count of zeros at or before
+                    # the extremum, i.e. the ordinal of the last zero <= t_ext).
+                    zi = nz_ta_used + n_before
+                    enriched.append((*h, zi))
+                hits = enriched
+            elif hits:
+                # baseline unknown -> pad with None so tuple width is consistent
+                hits = [(*h, None) for h in hits]
 
             if hits:
                 with T.time("main.append_hits"):
@@ -1185,8 +1245,13 @@ if __name__ == '__main__':
             rate_now=units_run/max((datetime.now()-t_run0).total_seconds(),1e-9)
             _tightest = None
             if tg:
+                # tg[0] is a 6-tuple/list (t, z, kind, gap, ngap, zero_index)
+                # for entries created after this update; older resumed
+                # entries may be 5-wide, so guard the trailing field.
+                _zi = tg[0][5] if len(tg[0]) >= 6 else None
                 _tightest = {"t": tg[0][0], "z": tg[0][1], "kind": tg[0][2],
-                             "gap": tg[0][3], "norm_gap": tg[0][4]}
+                             "gap": tg[0][3], "norm_gap": tg[0][4],
+                             "zero_index": _zi}
             _emit_status("chunk_end", chunk=c, wall=wall,
                 found=int(found), required=int(required),
                 short=int(max(0, required-found)),
@@ -1225,12 +1290,18 @@ if __name__ == '__main__':
         print("COMPLETE: every zero in the swept range located and on the line.")
     print("\n=== Tightest TRUE normalized zero-pair spacings ===")
     for e in tg[:15]:
-        t,z,kind,gap,ngap=e
-        print(f"  t={t:.6f} norm_gap={ngap:.5f} gap={gap:.6e} Z={z:+.3e} ({kind})")
+        # 6-tuple (with zero_index) or legacy 5-tuple
+        t, z, kind, gap, ngap = e[0], e[1], e[2], e[3], e[4]
+        zi = e[5] if len(e) >= 6 else None
+        zi_str = f"  #{zi:,}" if zi is not None else ""
+        print(f"  t={t:.6f} norm_gap={ngap:.5f} gap={gap:.6e} "
+              f"Z={z:+.3e} ({kind}){zi_str}")
 
     _emit_status("run_end",
         zeros_located_total=int(zver), zeros_required_total=int(zreq),
         zeros_short_total=int(short),
         complete=bool(short==0),
-        top_tightest=[{"t": t, "z": z, "kind": kind, "gap": gap, "norm_gap": ngap}
-                      for (t, z, kind, gap, ngap) in tg[:15]])
+        top_tightest=[{"t": e[0], "z": e[1], "kind": e[2],
+                       "gap": e[3], "norm_gap": e[4],
+                       "zero_index": (e[5] if len(e) >= 6 else None)}
+                      for e in tg[:15]])
