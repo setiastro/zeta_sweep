@@ -1,0 +1,36 @@
+# zeta_sweep runtime dependencies.
+#
+# Minimum versions only -- the code uses long-stable APIs of each of these,
+# so newer releases work fine and there's no reason to over-pin. Tested on
+# the versions in parens; anything at or above the pinned minimum should work.
+#
+# For the scanner (headless) you need numpy + mpmath + torch (with CUDA).
+# For the UI wrapper (zeta_scanner_ui.py) you additionally need PyQt6.
+# For the CSV patchers (patch_zero_indices.py, patch_hits_and_checkpoint.py)
+# you only need numpy + mpmath -- no torch, no PyQt6.
+
+numpy>=1.20        # (tested with 1.26)
+mpmath>=1.2        # (tested with 1.3)
+
+# PyTorch with CUDA support. IMPORTANT: install the torch build that matches
+# YOUR CUDA version and GPU. `pip install torch` picks a default that often
+# isn't right for your setup. Instead visit https://pytorch.org and use the
+# selector to get the correct wheel URL for your CUDA version, e.g.:
+#
+#   # CUDA 12.1 (typical for recent NVIDIA drivers)
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+#   # CUDA 11.8 (older drivers)
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+#
+# The version line below is the minimum for the API surface this project
+# uses (torch.cuda.is_available, torch.tensor with dtype=torch.float64,
+# elementwise cos, torch.cuda.synchronize). The scanner needs float64 on
+# GPU -- consumer NVIDIA cards run this slowly but correctly; datacenter
+# cards (A100/H100) run it much faster.
+torch>=1.10        # (tested with 2.2 on RTX 3070 Ti / CUDA 12.1)
+
+# GUI wrapper only. The scanner itself is headless and doesn't need this.
+# If you're only running the scanner from the command line, you can skip
+# this install and PyQt6 won't be imported.
+PyQt6>=6.2         # (tested with 6.6)
