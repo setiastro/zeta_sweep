@@ -748,7 +748,21 @@ class ScannerUI(QMainWindow):
             self.chunk_label.setText(str(c + 1))
             self.wall_label.setText(f"{event.get('wall', 0.0):.1f} s")
             self.last_wall = float(event.get("wall", 0.0))
-            self.rate_label.setText(f"{event.get('rate_t_per_s', 0.0):.2f} t/s")
+            # Show all three rates so recent optimizations are visible without
+            # waiting for the cumulative average to catch up: instantaneous
+            # (this chunk alone), 10-chunk moving average (smooth but current),
+            # and cumulative (whole-session, useful for long-run ETAs).
+            r_inst = event.get('rate_t_per_s', 0.0)   # renamed to inst upstream
+            r_recent = event.get('rate_recent_t_per_s', r_inst)
+            r_cum = event.get('rate_cumulative_t_per_s', r_inst)
+            self.rate_label.setText(
+                f"{r_inst:.2f} t/s   (10-chunk avg: {r_recent:.2f}, "
+                f"cum: {r_cum:.2f})")
+            # Stash recent-rate-inverted (= recent avg wall time per chunk)
+            # so the ETA ticker can use it instead of the session average,
+            # which lags badly after any speedup lands.
+            if r_recent > 0 and self.chunk_t_current > 0:
+                self._recent_avg_wall = self.chunk_t_current / r_recent
             self.refined_label.setText("yes" if event.get("refined") else "no")
             self.zloc_label.setText(f"{event.get('zeros_located_total', 0):,}")
             self.zreq_label.setText(f"{event.get('zeros_required_total', 0):,}")
@@ -880,14 +894,24 @@ class ScannerUI(QMainWindow):
             return
         elapsed = datetime.now() - self.run_start_time
         self.elapsed_label.setText(str(elapsed).split(".")[0])
-        # ETA: if we have completed at least one chunk this run, extrapolate
-        # from the average chunk wall time; otherwise unknown.
+        # ETA uses the recent chunk rate (last 10 chunks avg) if we have
+        # one, otherwise falls back to session average. Recent rate is much
+        # more useful when an optimization lands mid-run: cumulative rate
+        # takes hours to catch up to a new speedup, whereas 10-chunk avg
+        # reflects reality within ~30-40 minutes.
         if (self.chunks_completed_this_run > 0
             and self.total_chunks_target > 0):
             remaining_chunks = (self.total_chunks_target
                                 - (self.first_chunk_this_run + self.chunks_completed_this_run))
             if remaining_chunks > 0:
-                avg_per_chunk = elapsed.total_seconds() / self.chunks_completed_this_run
+                # Prefer the recent-rate the scanner just emitted (via
+                # self._last_recent_wall stashed by _on_status). Fall back
+                # to session average when we don't have one yet.
+                recent_avg = getattr(self, "_recent_avg_wall", None)
+                if recent_avg is not None and recent_avg > 0:
+                    avg_per_chunk = recent_avg
+                else:
+                    avg_per_chunk = elapsed.total_seconds() / self.chunks_completed_this_run
                 eta_secs = int(avg_per_chunk * remaining_chunks)
                 self.eta_label.setText(str(timedelta(seconds=eta_secs)))
             else:

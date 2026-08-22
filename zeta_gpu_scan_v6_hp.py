@@ -426,6 +426,20 @@ def _siegelz_batch_worker(args):
     mp.dps = dps
     return [float(siegelz(exact_t(t0_str, d))) for d in dt_list]
 
+def _nzeros_worker(args):
+    """Evaluate mpmath.nzeros(t0 + dt) at the given precision. Designed to
+    be submitted async so it runs concurrently with the GPU compute_Z_array.
+    args = (t0_str, dt, dps). Returns int.
+
+    Why a separate worker (not the main pool): the main 36-worker pool is
+    dedicated to CPU-bound parallel batches (theta anchors, precise_gap
+    scans). If we submitted nzeros there it would fight the extremum-loop
+    parallelization later. A tiny dedicated pool of 1-2 workers just for
+    nzeros keeps the two workloads cleanly separated."""
+    t0_str, dt, dps = args
+    mp.dps = dps
+    return int(nzeros(exact_t(t0_str, dt)))
+
 def mean_gap(t):
     return float(2*mp_pi / mp_log(mpf(str(t))/(2*mp_pi)))
 
@@ -750,7 +764,8 @@ def verify_violation(t0_str, dt_approx, kind, dps=100):
     return is_viol, dt_true, Z_true
 
 # ---------------- chunk ----------------
-def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None):
+def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None,
+                  nz_pool=None):
     """Timed splits inside a chunk:
         chunk.safe_boundary_a  | chunk.safe_boundary_b
         chunk.build_dt_grid    | chunk.compute_Z_array (already broken out)
@@ -762,12 +777,38 @@ def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None):
         chunk.extremum_loop           -- outer loop bookkeeping
           chunk.ext.parabola          -- vertex+curvature per extremum
           chunk.ext.mp_Z_verify       -- mpmath verify at extremum
-          chunk.ext.precise_gap       -- when ngap_est < NGAP_REFINE"""
+          chunk.ext.precise_gap       -- when ngap_est < NGAP_REFINE
+
+    nz_pool (optional): a small dedicated multiprocessing.Pool for running
+    mpmath.nzeros() concurrently with compute_Z_array. Kicked off right
+    after safe_boundary_b so the GPU work and the single-threaded nzeros
+    computation overlap -- saving roughly min(GPU_time, nzeros_time) per
+    chunk on the wall clock. If None, nzeros runs sequentially (backward
+    compatible)."""
     with T.time("chunk.safe_boundary_a"):
         if dt_a is None:
             dt_a = safe_boundary(t0_str, dt_start)
     with T.time("chunk.safe_boundary_b"):
         dt_b = safe_boundary(t0_str, dt_end)
+
+    # ---- Kick off nzeros async NOW (before compute_Z_array), so it runs
+    # concurrently with the GPU work. Both boundaries are known at this
+    # point, so both async submissions can go. On chunks 2+ nz_ta comes in
+    # via the seam and we only need to compute nz_tb; on chunk 0 we compute
+    # both. We resolve them (call .get()) further down, AFTER compute_Z_array
+    # has done its work. If nzeros finishes first the .get() returns
+    # instantly; if compute_Z_array finishes first we pay the remaining
+    # nzeros time -- either way, net wall time is min(gpu, nzeros) saved
+    # vs the old sequential order. If no nz_pool is provided we fall back
+    # to sequential (backward compatible).
+    nz_ta_async = None
+    nz_tb_async = None
+    if nz_pool is not None:
+        if nz_ta is None:
+            nz_ta_async = nz_pool.apply_async(
+                _nzeros_worker, ((t0_str, dt_a, DPS_VERIFY),))
+        nz_tb_async = nz_pool.apply_async(
+            _nzeros_worker, ((t0_str, dt_b, DPS_VERIFY),))
 
     with T.time("chunk.build_dt_grid"):
         dt_arr = np.arange(dt_a, dt_b, step)
@@ -777,12 +818,23 @@ def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None):
     with T.time("chunk.compute_Z_array"):
         Z = compute_Z_array(t0_str, dt_arr, pool)
 
+    # ---- Resolve async nzeros results (or fall back to sequential). The
+    # timers still fire and measure the RESIDUAL wait time -- if nzeros
+    # finished during compute_Z_array, these will show ~0s each; if it
+    # didn't, they show how much of nzeros' cost didn't get hidden by
+    # the overlap. Either number is informative for tuning.
     mp.dps = DPS_VERIFY
     if nz_ta is None:
         with T.time("chunk.nzeros_a"):
-            nz_ta = int(nzeros(exact_t(t0_str, dt_a)))
+            if nz_ta_async is not None:
+                nz_ta = nz_ta_async.get()
+            else:
+                nz_ta = int(nzeros(exact_t(t0_str, dt_a)))
     with T.time("chunk.nzeros_b"):
-        nz_tb = int(nzeros(exact_t(t0_str, dt_b)))
+        if nz_tb_async is not None:
+            nz_tb = nz_tb_async.get()
+        else:
+            nz_tb = int(nzeros(exact_t(t0_str, dt_b)))
     required = nz_tb - nz_ta
 
     with T.time("chunk.count_signs"):
@@ -1095,8 +1147,16 @@ if __name__ == '__main__':
     print()
     mpw = MP_WORKERS or cpu_count()
     t_run0=datetime.now()
+    _recent_walls = []   # rolling last-10-chunk wall times for rate_recent
     with T.time("startup.pool_init"):
         pool=Pool(processes=mpw, initializer=_worker_init)
+        # Dedicated tiny pool for async nzeros() calls -- lets nzeros_a and
+        # nzeros_b run concurrently with the GPU compute_Z_array, saving
+        # roughly the smaller of the two wall-times per chunk. 2 workers is
+        # enough (one per boundary; chunks 2+ only use one). Kept separate
+        # from the main 'pool' so nzeros doesn't fight the extremum-loop
+        # parallel batching later.
+        nz_pool=Pool(processes=2, initializer=_worker_init)
     prev_seam=_restore_seam if 'prev_nz' in st else None
 
     # Emit run_start with the run's config so a UI can populate its display.
@@ -1156,7 +1216,7 @@ if __name__ == '__main__':
             with T.time("main.process_chunk"):
                 hits,viols,found,required,refined,seam,nz_seam,dt_final,Z_final,nz_ta_used = process_chunk(
                     t0_str, dt_start, dt_end, STEP, pool,
-                    dt_a=prev_seam, nz_ta=prev_nz)
+                    dt_a=prev_seam, nz_ta=prev_nz, nz_pool=nz_pool)
 
             prev_seam = seam
             prev_nz = nz_seam
@@ -1241,8 +1301,23 @@ if __name__ == '__main__':
             # chunk_end: emit AFTER checkpoint save, so a UI reading this
             # event knows the on-disk state is consistent with the numbers
             # reported. Includes rate, cumulative counts, and current tightest.
-            units_run=(c+1-sc)*CHUNK_T
-            rate_now=units_run/max((datetime.now()-t_run0).total_seconds(),1e-9)
+            #
+            # Three rates so both "how fast right now" and "how fast on
+            # average" are visible:
+            #   rate_inst   = CHUNK_T / wall            (this chunk alone)
+            #   rate_recent = avg of last 10 chunks     (rolling, smooths spikes)
+            #   rate_cum    = units_run / elapsed       (whole session avg)
+            # rate_inst is what matches the wall time the user is watching.
+            # rate_cum was the only rate before, but it heavily lags after any
+            # optimization lands because early-session slow chunks dominate.
+            rate_inst = CHUNK_T / max(wall, 1e-9)
+            _recent_walls.append(wall)
+            if len(_recent_walls) > 10:
+                _recent_walls.pop(0)
+            rate_recent = (CHUNK_T * len(_recent_walls)) / max(sum(_recent_walls), 1e-9)
+            units_run = (c+1-sc)*CHUNK_T
+            rate_cum = units_run / max((datetime.now()-t_run0).total_seconds(), 1e-9)
+
             _tightest = None
             if tg:
                 # tg[0] is a 6-tuple/list (t, z, kind, gap, ngap, zero_index)
@@ -1259,18 +1334,21 @@ if __name__ == '__main__':
                 zeros_located_total=int(zver),
                 zeros_required_total=int(zreq),
                 zeros_short_total=int(short),
-                rate_t_per_s=rate_now,
+                rate_t_per_s=rate_inst,        # keep field name for UI compat;
+                                               # now means INSTANTANEOUS
+                rate_recent_t_per_s=rate_recent,
+                rate_cumulative_t_per_s=rate_cum,
                 tightest=_tightest)
 
             if c % 5 == 0 or hits or viols or refined or found<required:
-                units=(c+1-sc)*CHUNK_T
-                rate=units/max((datetime.now()-t_run0).total_seconds(),1e-9)
                 gstr=(f"{tg[0][4]:.4f}@{tg[0][0]:.1f}" if tg else "none")
                 ck = "OK" if found>=required else f"SHORT{found-required}"
                 rf = "*" if refined else " "
                 print(f"chunk {c:6d} t={t_start:.0f} {wall:5.1f}s{rf}"
                       f"hits={len(hits)} N={found}/{required}[{ck}] "
-                      f"rate={rate:.1f}t/s tightest={gstr}")
+                      f"rate={rate_inst:.1f}t/s "
+                      f"(10ch avg {rate_recent:.1f}, cum {rate_cum:.1f}) "
+                      f"tightest={gstr}")
                 # Per-chunk timing breakdown always printed on log lines,
                 # so you can watch idle vs GPU vs pool.map live.
                 print(T.format_chunk(wall))
@@ -1279,6 +1357,7 @@ if __name__ == '__main__':
         _emit_status("interrupted", zeros_located_total=int(zver))
     finally:
         pool.close(); pool.join()
+        nz_pool.close(); nz_pool.join()
         # Cumulative totals ALWAYS printed, including on Ctrl-C.
         print(T.format_totals())
 
