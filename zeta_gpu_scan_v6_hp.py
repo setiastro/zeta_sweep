@@ -765,7 +765,7 @@ def verify_violation(t0_str, dt_approx, kind, dps=100):
 
 # ---------------- chunk ----------------
 def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None,
-                  nz_pool=None):
+                  nz_pool=None, fine_step=None):
     """Timed splits inside a chunk:
         chunk.safe_boundary_a  | chunk.safe_boundary_b
         chunk.build_dt_grid    | chunk.compute_Z_array (already broken out)
@@ -841,16 +841,22 @@ def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None,
         found = count_sign_changes(Z)
 
     refined = False
+    # fine_step defaults to the module-level FINE_STEP (0.001, 10x denser than
+    # the coarse grid). Callers can pass a smaller value (e.g. FINE_STEP/10 =
+    # 0.0001) to force an ultra-fine resweep -- used when a chunk's shortfall
+    # persists across the next chunk boundary and we want to escalate before
+    # concluding it's a real miss.
+    _fs = fine_step if fine_step is not None else FINE_STEP
     if found < required:
         with T.time("chunk.fine_resweep"):
-            dt_fine = np.arange(dt_a, dt_b, FINE_STEP)
+            dt_fine = np.arange(dt_a, dt_b, _fs)
             if dt_fine[-1] < dt_b:
                 dt_fine = np.append(dt_fine, dt_b)
             Z_fine = compute_Z_array(t0_str, dt_fine, pool)
             found_fine = count_sign_changes(Z_fine)
         refined = True
         if found_fine >= found:
-            dt_arr, Z, step, found = dt_fine, Z_fine, FINE_STEP, found_fine
+            dt_arr, Z, step, found = dt_fine, Z_fine, _fs, found_fine
         if found_fine < required:
             with T.time("chunk.count_log_write"):
                 t_a = float(exact_t(t0_str, dt_a)); t_b = float(exact_t(t0_str, dt_b))
@@ -1128,6 +1134,23 @@ if __name__ == '__main__':
     zver=st.get('zeros_located',0); zreq=st.get('zeros_required',0)
     short=st.get('zeros_short',0)
     prev_nz=st.get('prev_nz'); _restore_seam=st.get('prev_seam')
+    # Cross-chunk boundary noise: rarely, mpmath.nzeros can be off by 1-2 at
+    # the exact boundary point where safe_boundary lands (because Turing's
+    # method has its own numerical precision at points where a zero sits very
+    # close to t). This manifests as chunk N reporting "short by K" while
+    # chunk N+1 reports "over by K" -- the totals net to zero across the
+    # seam. We detect this: if chunk N is short, we hold the shortfall
+    # pending; if chunk N+1 overshoots, we consume from pending (self-heal
+    # and log it). If chunk N+1 does NOT overshoot, the pending is a REAL
+    # miss and we log loudly for potential manual re-run with ultra-fine grid.
+    #
+    # Only the RESOLVED shortfall counts against `short` (the persistent
+    # counter shown in status). This state is per-session; not persisted
+    # across resume (worst case is one seam that could have self-healed
+    # across a resume boundary now shows as a real miss -- rare and
+    # correctable manually).
+    pending_short = 0
+    pending_short_chunk = None
 
     # --start-chunk overrides the checkpoint's resume position. Useful for
     # distributed work where a coordinator assigns explicit chunk ranges,
@@ -1222,8 +1245,49 @@ if __name__ == '__main__':
             prev_nz = nz_seam
             zver += found
             zreq += required
-            if found < required:
-                short += (required - found)
+
+            # Cross-chunk boundary noise handling (see pending_short comment
+            # near the top of __main__). Compute delta for THIS chunk, then:
+            #   - if pending from prev chunk exists and this chunk overshoots,
+            #     absorb the pending (self-heal): don't count it as a real short
+            #   - if pending exists but this chunk didn't overshoot, the pending
+            #     is a REAL miss -- log loudly (potential manual ultra-fine)
+            #   - if this chunk itself is short, set pending for next chunk
+            delta = int(found) - int(required)
+            _self_healed = 0
+            _real_miss = 0
+            if pending_short > 0:
+                if delta > 0:
+                    absorbed = min(delta, pending_short)
+                    pending_short -= absorbed
+                    _self_healed = absorbed
+                    print(f"[SEAM] chunk {pending_short_chunk} boundary noise "
+                          f"self-healed at chunk {c} "
+                          f"(chunk {c} had +{delta} extra zeros, absorbed "
+                          f"{absorbed}). No real miss.")
+                    if pending_short == 0:
+                        pending_short_chunk = None
+                else:
+                    # Pending did not clear -- REAL miss from the pending chunk.
+                    # Count it toward the persistent shortfall counter and log
+                    # for potential manual intervention.
+                    _real_miss = pending_short
+                    short += pending_short
+                    print(f"[REAL MISS] chunk {pending_short_chunk} short by "
+                          f"{pending_short} zeros, NOT recovered by chunk {c} "
+                          f"(chunk {c} delta={delta:+d}). Consider re-running "
+                          f"chunk {pending_short_chunk} with an ultra-fine grid "
+                          f"(FINE_STEP=0.0001) via a targeted resweep script.")
+                    pending_short = 0
+                    pending_short_chunk = None
+            if delta < 0:
+                # This chunk was short. Hold it as pending; next chunk gets to
+                # absorb it via overshoot before we count it as a real miss.
+                pending_short = -delta
+                pending_short_chunk = c
+                # Note: we do NOT increment `short` here yet. It only gets
+                # counted if the next chunk fails to absorb it.
+
             wall=time.time()-wall0
 
             # Log every zero located in this chunk. Every t > 3e12 is past the
@@ -1334,6 +1398,16 @@ if __name__ == '__main__':
                 zeros_located_total=int(zver),
                 zeros_required_total=int(zreq),
                 zeros_short_total=int(short),
+                # Cross-chunk seam accounting: how much of this chunk's
+                # overshoot was consumed by a prior chunk's pending short
+                # (self-heal), how much of the pending was declared a real
+                # miss because this chunk didn't overshoot, and the current
+                # pending state.
+                self_healed=int(_self_healed),
+                real_miss=int(_real_miss),
+                pending_short=int(pending_short),
+                pending_short_chunk=(pending_short_chunk
+                    if pending_short_chunk is not None else -1),
                 rate_t_per_s=rate_inst,        # keep field name for UI compat;
                                                # now means INSTANTANEOUS
                 rate_recent_t_per_s=rate_recent,
@@ -1363,6 +1437,22 @@ if __name__ == '__main__':
 
     print(f"\nZeros located by sweep: {zver}")
     print(f"Zeros required (nzeros): {zreq}")
+
+    # If the LAST chunk had a shortfall we're still holding as pending (no
+    # subsequent chunk got to absorb it), we have to make a call: either
+    # count it as real, or treat it as "would probably self-heal if we had
+    # another chunk." The honest thing is to count it -- we can't verify
+    # self-heal from data we don't have. Print a specific note so the
+    # user sees exactly what happened.
+    if pending_short > 0:
+        short += pending_short
+        print(f"[NOTE] Final chunk {pending_short_chunk} had shortfall "
+              f"{pending_short} with no following chunk to check for "
+              f"self-heal. Counted as unresolved. If you run one more "
+              f"chunk past this range and it overshoots, the shortfall "
+              f"was seam boundary noise; otherwise a real miss.")
+        pending_short = 0
+
     print(f"Still short after refine: {short}  "
           f"({100*(zreq-short)/max(zreq,1):.4f}% complete)")
     if short==0:

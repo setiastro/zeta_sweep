@@ -766,7 +766,18 @@ class ScannerUI(QMainWindow):
             self.refined_label.setText("yes" if event.get("refined") else "no")
             self.zloc_label.setText(f"{event.get('zeros_located_total', 0):,}")
             self.zreq_label.setText(f"{event.get('zeros_required_total', 0):,}")
-            self.zshort_label.setText(str(event.get("zeros_short_total", 0)))
+            # Shortfall display: distinguish confirmed unresolved misses from
+            # pending-seam-noise that may self-heal on the next chunk. The
+            # scanner's `short` counter no longer includes pending shortfalls
+            # (they only count once confirmed as a real miss). We show both:
+            # "5" if fully confirmed, "0 (2 pending)" if the current chunk was
+            # short and we're waiting to see if the next chunk absorbs it.
+            _short_total = int(event.get("zeros_short_total", 0))
+            _pending = int(event.get("pending_short", 0))
+            if _pending > 0:
+                self.zshort_label.setText(f"{_short_total} ({_pending} pending seam)")
+            else:
+                self.zshort_label.setText(str(_short_total))
             self._update_tightest_pair(event.get("tightest"))
 
         elif kind == "violation_survived":
