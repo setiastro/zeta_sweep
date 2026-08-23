@@ -930,6 +930,219 @@ def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None,
 
     return hits, violations, found, required, refined, dt_b, nz_tb, dt_arr, Z, nz_ta
 
+
+def ultra_fine_recover(t0_str, pending_state, pool, ultra_fine_step=None):
+    """Re-run a pending chunk at ULTRA-FINE grid resolution (default:
+    FINE_STEP / 10 = 0.0001, i.e. 10x denser than the normal fine resweep,
+    100x denser than the coarse grid) to find zeros the fine resweep missed.
+
+    This is the "real miss" recovery path: called when a chunk's shortfall
+    fails to self-heal at the next chunk's boundary. Ultra-fine resweep is
+    expensive (roughly 10x a normal chunk's GPU work, ~30-40 minutes at
+    1e13 on the reference RTX 3070 Ti hardware), so it only fires when the
+    seam-heal path has ruled out boundary noise.
+
+    Returns (recovered_count, new_dt_zeros, new_Z_left, new_Z_right,
+             new_dt_left, new_dt_right):
+    the number of newly-found zeros (should equal pending_state['shortfall']
+    on success), and arrays with their locations and straddling Z values,
+    ready to append to the zeros CSV.
+
+    If recovered_count < shortfall, the deficit is a REAL persistent miss
+    (ultra-fine couldn't find them either) -- caller decides how to log it.
+    """
+    _fs = ultra_fine_step if ultra_fine_step is not None else FINE_STEP / 10.0
+    dt_a = pending_state['dt_a']
+    dt_b = pending_state['seam']
+
+    print(f"[ULTRA-FINE] Re-sweeping chunk {pending_state['chunk']} at "
+          f"step={_fs:g} to recover {pending_state['shortfall']} missing "
+          f"zeros. Expected wall time: ~{int(30 * (0.001/_fs))} minutes...",
+          flush=True)
+
+    with T.time("ultrafine.build_grid"):
+        dt_ultra = np.arange(dt_a, dt_b, _fs)
+        if dt_ultra[-1] < dt_b:
+            dt_ultra = np.append(dt_ultra, dt_b)
+
+    with T.time("ultrafine.compute_Z"):
+        Z_ultra = compute_Z_array(t0_str, dt_ultra, pool)
+
+    # Find every sign change in the ultra-fine sweep. These are all the
+    # zeros in [dt_a, dt_b], including the ones we already knew about.
+    sc_mask = (Z_ultra[:-1] >= 0) != (Z_ultra[1:] >= 0)
+    ultra_zero_idxs = np.nonzero(sc_mask)[0]
+    n_ultra_found = len(ultra_zero_idxs)
+    print(f"[ULTRA-FINE] Found {n_ultra_found} zeros in resweep "
+          f"(pending chunk originally found "
+          f"{n_ultra_found - pending_state['shortfall']}).", flush=True)
+
+    # Linear-interp the ultra-fine zeros to precise dt
+    dz = Z_ultra[ultra_zero_idxs + 1] - Z_ultra[ultra_zero_idxs]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dt_ultra_zeros = np.where(
+            dz != 0.0,
+            dt_ultra[ultra_zero_idxs]
+              - Z_ultra[ultra_zero_idxs]
+              * (dt_ultra[ultra_zero_idxs + 1] - dt_ultra[ultra_zero_idxs]) / dz,
+            0.5 * (dt_ultra[ultra_zero_idxs] + dt_ultra[ultra_zero_idxs + 1])
+        )
+
+    # Compare to previously-known zeros. Any ultra-fine zero that is not
+    # within STEP of any previously-known zero is NEW (a recovered miss).
+    # We use STEP (not FINE_STEP) as the match threshold because that's
+    # the resolution the coarse sweep already handled -- an ultra-fine
+    # zero within STEP of a known one is the same zero, just relocated
+    # to higher precision.
+    prev_zeros = np.asarray(pending_state['prev_zeros_dt'])
+    if len(prev_zeros) > 0:
+        # For each ultra zero, find nearest previous zero via searchsorted
+        insert_pos = np.searchsorted(prev_zeros, dt_ultra_zeros)
+        # Distance to nearest previous zero on either side
+        left_pos = np.clip(insert_pos - 1, 0, len(prev_zeros) - 1)
+        right_pos = np.clip(insert_pos, 0, len(prev_zeros) - 1)
+        dist_left = np.abs(dt_ultra_zeros - prev_zeros[left_pos])
+        dist_right = np.abs(dt_ultra_zeros - prev_zeros[right_pos])
+        min_dist = np.minimum(dist_left, dist_right)
+        new_mask = min_dist > STEP
+    else:
+        # No previous zeros known -- all ultra-fine zeros are "new"
+        new_mask = np.ones(len(dt_ultra_zeros), dtype=bool)
+
+    new_indices = np.nonzero(new_mask)[0]
+    n_recovered = len(new_indices)
+    print(f"[ULTRA-FINE] {n_recovered} zeros are new (not within STEP={STEP} "
+          f"of any previously-known chunk zero). Expected: "
+          f"{pending_state['shortfall']}.", flush=True)
+
+    # Package up the new zeros for the caller to append to the CSV
+    new_dt_zeros = dt_ultra_zeros[new_indices]
+    new_Z_left   = Z_ultra[ultra_zero_idxs[new_indices]]
+    new_Z_right  = Z_ultra[ultra_zero_idxs[new_indices] + 1]
+    new_dt_left  = dt_ultra[ultra_zero_idxs[new_indices]]
+    new_dt_right = dt_ultra[ultra_zero_idxs[new_indices] + 1]
+
+    return (n_recovered, new_dt_zeros, new_Z_left, new_Z_right,
+            new_dt_left, new_dt_right)
+
+
+def append_recovered_zeros(t0_str, dt_zeros, Z_left, Z_right,
+                            dt_left, dt_right, chunk_idx, baseline_indices):
+    """Append recovered-from-ultra-fine zeros to the zeros CSV, with correct
+    ordinal indices. Uses `-1000000 - chunk_idx` as the chunk marker, so
+    recovered rows are unambiguously identifiable by `chunk < 0` (works even
+    for chunk 0, which -0 would not distinguish from a normal chunk 0 row).
+    To recover the original chunk from the marker: orig = -chunk - 1_000_000.
+
+    baseline_indices: list of int, one per zero, giving the ORDINAL each
+    recovered zero should have. Caller computes these by inserting the
+    new zero's t position into the existing ordinal sequence."""
+    if len(dt_zeros) == 0:
+        return
+    t0_mpf = mpf(t0_str)
+    marker = -1_000_000 - abs(chunk_idx)
+    with open(ZEROS_LOG, 'a') as f:
+        for k in range(len(dt_zeros)):
+            t_abs = float(t0_mpf + mpf(repr(float(dt_zeros[k]))))
+            zi = baseline_indices[k]
+            f.write(f"{t_abs:.10f},{Z_left[k]:+.6e},{Z_right[k]:+.6e},"
+                    f"{dt_left[k]:.6f},{dt_right[k]:.6f},"
+                    f"{marker},{zi}\n")
+
+
+def bump_ordinals_after_recovery(t0_str, new_zero_t_abs_list, tz, tg):
+    """After K new zeros have been recovered and appended to the CSV, every
+    PREVIOUSLY-WRITTEN zero with t > any_new_zero_t needs its zero_index
+    bumped up. Each existing zero's bump = (number of new zeros with t <
+    existing zero's t). This restores strict ordinal correctness: after this
+    call, `zero_index` monotonically increases with t across the entire CSV.
+
+    Also updates leaderboard entries (tz, tg) in place: any entry with t >
+    a new_zero_t gets its zero_index bumped by the same amount.
+
+    Implementation is atomic: writes to a temp file first, then renames over
+    the original. If interrupted mid-write, the original is untouched. On
+    Windows the rename is os.replace which is atomic (unlike os.rename).
+
+    Called only after successful ultra-fine recovery, so it fires at most
+    a handful of times per long run. Cost: one full CSV pass -- for 1M zeros
+    that's a few seconds. Acceptable given how rarely this runs.
+    """
+    if not new_zero_t_abs_list:
+        return
+    new_t = sorted(float(t) for t in new_zero_t_abs_list)
+
+    def bump_for(t_val):
+        """How many new zeros have t < t_val? That's how much this row's
+        ordinal should be bumped up."""
+        # binary search: find insertion point of t_val in new_t; that's the
+        # count of new zeros with strictly smaller t.
+        lo, hi = 0, len(new_t)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if new_t[mid] < t_val:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    # Rewrite the zeros CSV
+    tmp_path = ZEROS_LOG + ".ordbump.tmp"
+    n_bumped = 0
+    # Precompute the exact t values of the just-inserted new zeros so we can
+    # skip them (they already have correct ordinals). We use a set of the
+    # formatted string forms as they appear in the CSV, so comparisons are
+    # exact and not subject to float roundoff.
+    new_t_strs = set(f"{t:.10f}" for t in new_t)
+    with open(ZEROS_LOG, 'r') as fin, open(tmp_path, 'w') as fout:
+        header = fin.readline()
+        fout.write(header)
+        cols = header.strip().split(',')
+        try:
+            t_ix = cols.index('t')
+            zi_ix = cols.index('zero_index')
+        except ValueError:
+            # Old-format CSV without zero_index -- nothing to bump
+            os.remove(tmp_path)
+            return
+        for line in fin:
+            parts = line.rstrip('\n').split(',')
+            if len(parts) <= zi_ix or not parts[zi_ix]:
+                fout.write(line)
+                continue
+            try:
+                t_val = float(parts[t_ix])
+                zi_val = int(parts[zi_ix])
+            except (ValueError, IndexError):
+                fout.write(line)
+                continue
+            # Skip the newly-inserted recovered rows themselves (they already
+            # have correct ordinals). Detect by exact t-string match.
+            if parts[t_ix] in new_t_strs:
+                fout.write(line)
+                continue
+            bump = bump_for(t_val)
+            if bump > 0:
+                parts[zi_ix] = str(zi_val + bump)
+                fout.write(','.join(parts) + '\n')
+                n_bumped += 1
+            else:
+                fout.write(line)
+    # Atomic swap
+    os.replace(tmp_path, ZEROS_LOG)
+
+    # Also bump leaderboard entries in place. Each entry is a 6-tuple
+    # (t, z, kind, gap, ngap, zero_index).
+    for board in (tz, tg):
+        for entry in board:
+            if len(entry) >= 6 and entry[5] is not None:
+                bump = bump_for(float(entry[0]))
+                if bump > 0:
+                    entry[5] = int(entry[5]) + bump
+
+    print(f"[BUMP] Bumped {n_bumped:,} existing zero ordinals to account for "
+          f"{len(new_t)} recovered zero(s) inserted mid-catalog.", flush=True)
+
 # ---------------- checkpoint io ----------------
 def load_ckpt():
     if not os.path.exists(CHECKPOINT):
@@ -1142,15 +1355,19 @@ if __name__ == '__main__':
     # seam. We detect this: if chunk N is short, we hold the shortfall
     # pending; if chunk N+1 overshoots, we consume from pending (self-heal
     # and log it). If chunk N+1 does NOT overshoot, the pending is a REAL
-    # miss and we log loudly for potential manual re-run with ultra-fine grid.
+    # miss and we auto-recover by re-running chunk N with an ULTRA-FINE
+    # grid (FINE_STEP / 10 = 0.0001, so 10x denser than the standard fine
+    # resweep). Any newly-found zeros are appended to the zeros CSV with
+    # their correct ordinal indices. If ultra-fine STILL doesn't find them
+    # (very unlikely), the shortfall counts as a real unresolved miss.
     #
     # Only the RESOLVED shortfall counts against `short` (the persistent
-    # counter shown in status). This state is per-session; not persisted
-    # across resume (worst case is one seam that could have self-healed
-    # across a resume boundary now shows as a real miss -- rare and
-    # correctable manually).
-    pending_short = 0
-    pending_short_chunk = None
+    # counter shown in status). pending_state carries enough context to
+    # re-run the pending chunk if needed; None means no pending. Not
+    # persisted across resume for now (worst case: one seam right at a
+    # resume boundary needs manual re-check).
+    pending_state = None    # or dict: {chunk, shortfall, dt_start, dt_end,
+                            # dt_a, nz_ta, seam, nz_seam, prev_zeros_t}
 
     # --start-chunk overrides the checkpoint's resume position. Useful for
     # distributed work where a coordinator assigns explicit chunk ranges,
@@ -1246,47 +1463,151 @@ if __name__ == '__main__':
             zver += found
             zreq += required
 
-            # Cross-chunk boundary noise handling (see pending_short comment
+            # Cross-chunk boundary noise handling (see pending_state comment
             # near the top of __main__). Compute delta for THIS chunk, then:
             #   - if pending from prev chunk exists and this chunk overshoots,
             #     absorb the pending (self-heal): don't count it as a real short
-            #   - if pending exists but this chunk didn't overshoot, the pending
-            #     is a REAL miss -- log loudly (potential manual ultra-fine)
+            #   - if pending exists but this chunk didn't overshoot, escalate
+            #     to ULTRA-FINE resweep on the pending chunk (auto-recovery)
             #   - if this chunk itself is short, set pending for next chunk
             delta = int(found) - int(required)
             _self_healed = 0
             _real_miss = 0
-            if pending_short > 0:
+            _recovered = 0
+            if pending_state is not None:
                 if delta > 0:
-                    absorbed = min(delta, pending_short)
-                    pending_short -= absorbed
+                    # Self-heal: chunk N+1 overshot enough to absorb chunk N's
+                    # pending shortfall. Confirms seam boundary noise, no
+                    # real miss.
+                    absorbed = min(delta, pending_state['shortfall'])
+                    pending_state['shortfall'] -= absorbed
                     _self_healed = absorbed
-                    print(f"[SEAM] chunk {pending_short_chunk} boundary noise "
-                          f"self-healed at chunk {c} "
+                    print(f"[SEAM] chunk {pending_state['chunk']} boundary "
+                          f"noise self-healed at chunk {c} "
                           f"(chunk {c} had +{delta} extra zeros, absorbed "
                           f"{absorbed}). No real miss.")
-                    if pending_short == 0:
-                        pending_short_chunk = None
+                    if pending_state['shortfall'] == 0:
+                        pending_state = None
                 else:
-                    # Pending did not clear -- REAL miss from the pending chunk.
-                    # Count it toward the persistent shortfall counter and log
-                    # for potential manual intervention.
-                    _real_miss = pending_short
-                    short += pending_short
-                    print(f"[REAL MISS] chunk {pending_short_chunk} short by "
-                          f"{pending_short} zeros, NOT recovered by chunk {c} "
-                          f"(chunk {c} delta={delta:+d}). Consider re-running "
-                          f"chunk {pending_short_chunk} with an ultra-fine grid "
-                          f"(FINE_STEP=0.0001) via a targeted resweep script.")
-                    pending_short = 0
-                    pending_short_chunk = None
+                    # No self-heal -- escalate to ultra-fine resweep on the
+                    # PENDING chunk. This is expensive (~30-40 min at 1e13
+                    # for FINE_STEP/10), but rare. Auto-recovers real misses
+                    # so the dataset stays complete without human
+                    # intervention.
+                    print(f"[REAL MISS] chunk {pending_state['chunk']} short "
+                          f"by {pending_state['shortfall']} zeros, NOT "
+                          f"recovered by chunk {c} (chunk {c} delta="
+                          f"{delta:+d}). Escalating to ultra-fine resweep.",
+                          flush=True)
+                    with T.time("main.ultra_fine_recover"):
+                        n_recovered, new_dt_zeros, new_Zl, new_Zr, \
+                            new_dtl, new_dtr = ultra_fine_recover(
+                                t0_str, pending_state, pool)
+                    if n_recovered > 0:
+                        # Assign each recovered zero its TRUE ordinal (baseline
+                        # + 1 + number of previous zeros with smaller dt +
+                        # number of already-inserted recovered zeros with
+                        # smaller dt), then bump every existing zero's ordinal
+                        # by (number of new zeros with smaller t) to keep the
+                        # whole catalog strictly monotonic in t. This is the
+                        # mathematically correct fix -- inserting K zeros in
+                        # the middle of a chunk shifts every subsequent zero's
+                        # ordinal up by K, no exceptions.
+                        prev_dt = np.asarray(pending_state['prev_zeros_dt'])
+                        baseline = pending_state['nz_ta']
+                        sort_order = np.argsort(new_dt_zeros)
+                        new_dt_sorted = new_dt_zeros[sort_order]
+                        new_Zl_sorted = new_Zl[sort_order]
+                        new_Zr_sorted = new_Zr[sort_order]
+                        new_dtl_sorted = new_dtl[sort_order]
+                        new_dtr_sorted = new_dtr[sort_order]
+                        new_ordinals = []
+                        # Also collect the absolute t values of the new zeros
+                        # for the ordinal bump pass below.
+                        t0_mpf_local = mpf(t0_str)
+                        new_t_abs = []
+                        for i, new_dt in enumerate(new_dt_sorted):
+                            n_prev_before = int(np.searchsorted(prev_dt, new_dt))
+                            true_ordinal = baseline + 1 + n_prev_before + i
+                            new_ordinals.append(true_ordinal)
+                            new_t_abs.append(float(t0_mpf_local
+                                                   + mpf(repr(float(new_dt)))))
+                        append_recovered_zeros(t0_str, new_dt_sorted,
+                            new_Zl_sorted, new_Zr_sorted,
+                            new_dtl_sorted, new_dtr_sorted,
+                            pending_state['chunk'], new_ordinals)
+                        # Now bump every existing zero's ordinal in the CSV
+                        # AND in the leaderboards, so the whole catalog stays
+                        # monotonic in t.
+                        with T.time("main.bump_ordinals"):
+                            bump_ordinals_after_recovery(t0_str, new_t_abs,
+                                                          tz, tg)
+                        zver += n_recovered
+                        _recovered = n_recovered
+                        # Update the "short" counter with whatever the
+                        # ultra-fine DIDN'T find (should be 0 in the normal
+                        # case; positive if ultra-fine also came up short).
+                        residual = pending_state['shortfall'] - n_recovered
+                        if residual > 0:
+                            short += residual
+                            _real_miss = residual
+                            print(f"[REAL MISS PERSISTENT] chunk "
+                                  f"{pending_state['chunk']}: ultra-fine "
+                                  f"recovered {n_recovered}/{pending_state['shortfall']} "
+                                  f"missing zeros. {residual} still not "
+                                  f"accounted for. These are real misses.")
+                        else:
+                            print(f"[RECOVERED] chunk "
+                                  f"{pending_state['chunk']}: ultra-fine "
+                                  f"successfully recovered all "
+                                  f"{n_recovered} missing zeros. "
+                                  f"Dataset now complete for that chunk.")
+                    else:
+                        # Ultra-fine came up empty on new zeros -- surprising.
+                        # Count as real miss for accounting purposes.
+                        short += pending_state['shortfall']
+                        _real_miss = pending_state['shortfall']
+                        print(f"[REAL MISS PERSISTENT] chunk "
+                              f"{pending_state['chunk']}: ultra-fine resweep "
+                              f"found 0 new zeros. Shortfall of "
+                              f"{pending_state['shortfall']} counted as "
+                              f"unresolved.")
+                    pending_state = None
             if delta < 0:
-                # This chunk was short. Hold it as pending; next chunk gets to
-                # absorb it via overshoot before we count it as a real miss.
-                pending_short = -delta
-                pending_short_chunk = c
+                # This chunk was short. Compute this chunk's zero dt values
+                # from Z_final so ultra-fine (if it fires) can identify which
+                # zeros are NEW vs. which we already have. Also snapshot the
+                # boundaries so a re-run doesn't need fresh safe_boundary or
+                # nzeros calls.
+                sc_mask_this = (Z_final[:-1] >= 0) != (Z_final[1:] >= 0)
+                sc_idx_this = np.nonzero(sc_mask_this)[0]
+                # linear-interp to get dt of each zero
+                dz_this = Z_final[sc_idx_this + 1] - Z_final[sc_idx_this]
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    dt_zeros_this = np.where(
+                        dz_this != 0.0,
+                        dt_final[sc_idx_this]
+                          - Z_final[sc_idx_this]
+                          * (dt_final[sc_idx_this + 1]
+                             - dt_final[sc_idx_this]) / dz_this,
+                        0.5 * (dt_final[sc_idx_this]
+                               + dt_final[sc_idx_this + 1])
+                    )
+                pending_state = {
+                    'chunk': c,
+                    'shortfall': -delta,
+                    'dt_start': dt_start,
+                    'dt_end': dt_end,
+                    'dt_a': (prev_seam if prev_seam is not None
+                             else dt_final[0]),   # the chunk's true left edge
+                    'seam': seam,                  # the chunk's true right edge
+                    'nz_ta': nz_ta_used,
+                    'nz_seam': nz_seam,
+                    'prev_zeros_dt': dt_zeros_this,
+                }
                 # Note: we do NOT increment `short` here yet. It only gets
-                # counted if the next chunk fails to absorb it.
+                # counted if the next chunk fails to absorb it AND ultra-fine
+                # recovery also fails to find the missing zeros.
 
             wall=time.time()-wall0
 
@@ -1400,14 +1721,18 @@ if __name__ == '__main__':
                 zeros_short_total=int(short),
                 # Cross-chunk seam accounting: how much of this chunk's
                 # overshoot was consumed by a prior chunk's pending short
-                # (self-heal), how much of the pending was declared a real
-                # miss because this chunk didn't overshoot, and the current
-                # pending state.
+                # (self-heal), how much was auto-recovered by ultra-fine
+                # resweep, how much of the pending was declared a real miss
+                # (ultra-fine also came up short), and the current pending
+                # state. `pending_short` here is what's currently unresolved
+                # awaiting the NEXT chunk's decision.
                 self_healed=int(_self_healed),
+                recovered=int(_recovered),
                 real_miss=int(_real_miss),
-                pending_short=int(pending_short),
-                pending_short_chunk=(pending_short_chunk
-                    if pending_short_chunk is not None else -1),
+                pending_short=int(pending_state['shortfall']
+                                  if pending_state is not None else 0),
+                pending_short_chunk=(pending_state['chunk']
+                    if pending_state is not None else -1),
                 rate_t_per_s=rate_inst,        # keep field name for UI compat;
                                                # now means INSTANTANEOUS
                 rate_recent_t_per_s=rate_recent,
@@ -1439,19 +1764,60 @@ if __name__ == '__main__':
     print(f"Zeros required (nzeros): {zreq}")
 
     # If the LAST chunk had a shortfall we're still holding as pending (no
-    # subsequent chunk got to absorb it), we have to make a call: either
-    # count it as real, or treat it as "would probably self-heal if we had
-    # another chunk." The honest thing is to count it -- we can't verify
-    # self-heal from data we don't have. Print a specific note so the
-    # user sees exactly what happened.
-    if pending_short > 0:
-        short += pending_short
-        print(f"[NOTE] Final chunk {pending_short_chunk} had shortfall "
-              f"{pending_short} with no following chunk to check for "
-              f"self-heal. Counted as unresolved. If you run one more "
-              f"chunk past this range and it overshoots, the shortfall "
-              f"was seam boundary noise; otherwise a real miss.")
-        pending_short = 0
+    # subsequent chunk got to absorb it via overshoot), the honest thing is
+    # to escalate to ultra-fine resweep directly rather than assume the seam
+    # would have self-healed. This treats the end-of-run pending exactly the
+    # same as a mid-run persistent shortfall.
+    if pending_state is not None:
+        print(f"[END-OF-RUN PENDING] Final chunk {pending_state['chunk']} had "
+              f"shortfall {pending_state['shortfall']} with no following "
+              f"chunk to check for seam self-heal. Escalating to ultra-fine "
+              f"resweep directly.", flush=True)
+        with T.time("main.ultra_fine_recover_endrun"):
+            n_recovered, new_dt_zeros, new_Zl, new_Zr, \
+                new_dtl, new_dtr = ultra_fine_recover(
+                    t0_str, pending_state, pool)
+        if n_recovered > 0:
+            prev_dt = np.asarray(pending_state['prev_zeros_dt'])
+            baseline = pending_state['nz_ta']
+            sort_order = np.argsort(new_dt_zeros)
+            new_dt_sorted = new_dt_zeros[sort_order]
+            new_Zl_sorted = new_Zl[sort_order]
+            new_Zr_sorted = new_Zr[sort_order]
+            new_dtl_sorted = new_dtl[sort_order]
+            new_dtr_sorted = new_dtr[sort_order]
+            new_ordinals = []
+            t0_mpf_local = mpf(t0_str)
+            new_t_abs = []
+            for i, new_dt in enumerate(new_dt_sorted):
+                n_prev_before = int(np.searchsorted(prev_dt, new_dt))
+                new_ordinals.append(baseline + 1 + n_prev_before + i)
+                new_t_abs.append(float(t0_mpf_local
+                                       + mpf(repr(float(new_dt)))))
+            append_recovered_zeros(t0_str, new_dt_sorted, new_Zl_sorted,
+                new_Zr_sorted, new_dtl_sorted, new_dtr_sorted,
+                pending_state['chunk'], new_ordinals)
+            # Bump every existing zero's ordinal to keep the catalog strictly
+            # monotonic in t after these insertions.
+            bump_ordinals_after_recovery(t0_str, new_t_abs, tz, tg)
+            zver += n_recovered
+            residual = pending_state['shortfall'] - n_recovered
+            if residual > 0:
+                short += residual
+                print(f"[END-OF-RUN] chunk {pending_state['chunk']}: "
+                      f"ultra-fine recovered {n_recovered}/"
+                      f"{pending_state['shortfall']}; {residual} still "
+                      f"unresolved.")
+            else:
+                print(f"[END-OF-RUN RECOVERED] chunk "
+                      f"{pending_state['chunk']}: ultra-fine successfully "
+                      f"recovered all {n_recovered} missing zeros.")
+        else:
+            short += pending_state['shortfall']
+            print(f"[END-OF-RUN REAL MISS] chunk {pending_state['chunk']}: "
+                  f"ultra-fine found 0 new zeros. Shortfall counted as "
+                  f"unresolved.")
+        pending_state = None
 
     print(f"Still short after refine: {short}  "
           f"({100*(zreq-short)/max(zreq,1):.4f}% complete)")

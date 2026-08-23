@@ -778,6 +778,29 @@ class ScannerUI(QMainWindow):
                 self.zshort_label.setText(f"{_short_total} ({_pending} pending seam)")
             else:
                 self.zshort_label.setText(str(_short_total))
+
+            # Also mention any seam events that happened this chunk in the
+            # status bar -- so the user sees when auto-recovery fires and
+            # what it did. These are transient (overwritten on the next
+            # chunk_end), which is fine; the persistent record lives in the
+            # log output pane and (for real misses) the shortfall counter.
+            _healed = int(event.get("self_healed", 0))
+            _rec = int(event.get("recovered", 0))
+            _rm = int(event.get("real_miss", 0))
+            if _rec > 0:
+                self.statusBar().showMessage(
+                    f"Chunk {event.get('chunk')}: ultra-fine recovered "
+                    f"{_rec} zeros from seam boundary noise.", 8000)
+            elif _healed > 0:
+                self.statusBar().showMessage(
+                    f"Chunk {event.get('chunk')}: seam boundary noise "
+                    f"({_healed} zeros) self-healed with prior chunk. "
+                    f"No real miss.", 5000)
+            elif _rm > 0:
+                self.statusBar().showMessage(
+                    f"Chunk {event.get('chunk')}: {_rm} REAL MISS zero(s) "
+                    f"unrecovered by ultra-fine resweep. See log.", 15000)
+
             self._update_tightest_pair(event.get("tightest"))
 
         elif kind == "violation_survived":
