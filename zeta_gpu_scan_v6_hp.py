@@ -1222,6 +1222,36 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
     idx = np.nonzero(sc)[0]
     if len(idx) == 0:
         return 0
+
+    # Duplicate-chunk guard: if the CSV already has rows for this chunk_idx,
+    # skip the append entirely. This prevents the exact scenario where a user
+    # accidentally re-runs an already-completed chunk (e.g. by pressing Start
+    # instead of Resume with a stale start-chunk override). The check is a
+    # quick scan of the last ~50 lines of the CSV (chunks are processed in
+    # order, so if duplicate rows exist they'll be at the tail).
+    if os.path.exists(ZEROS_LOG) and chunk_idx >= 0:
+        try:
+            with open(ZEROS_LOG, 'rb') as _f:
+                # Read the last 8KB of the file (enough for ~50 rows)
+                _f.seek(0, 2)
+                _fsize = _f.tell()
+                _f.seek(max(0, _fsize - 8192))
+                _tail = _f.read().decode('utf-8', errors='replace')
+            _tail_lines = _tail.strip().split('\n')
+            for _line in _tail_lines[-50:]:
+                _parts = _line.split(',')
+                # chunk is the 6th column (index 5)
+                if len(_parts) > 5:
+                    try:
+                        if int(_parts[5]) == chunk_idx:
+                            print(f"[DUPLICATE GUARD] Zeros CSV already "
+                                  f"contains rows for chunk {chunk_idx}. "
+                                  f"SKIPPING append to prevent duplicates.")
+                            return 0
+                    except ValueError:
+                        pass
+        except Exception:
+            pass    # can't check, proceed with append
     # linear-interp zero locations in dt-space (small values, exact math)
     dz = Z[idx+1] - Z[idx]
     # guard against exact-zero denominator (Z[i]==Z[i+1]==0 is possible but
@@ -1376,6 +1406,45 @@ if __name__ == '__main__':
     # checkpoint's prev_seam/prev_nz either -- those are for the previous
     # chunk in the checkpoint's numbering, which is not our previous chunk.
     if _FORCE_START_CHUNK is not None:
+        # Safety check: if the checkpoint already has progress past the
+        # requested start chunk, warn loudly. This is the exact scenario
+        # that causes duplicate CSV rows (user presses Start instead of
+        # Resume with a stale start-chunk override).
+        ckpt_next = st['next_chunk']
+        if ckpt_next > _FORCE_START_CHUNK:
+            print()
+            print("!"*64)
+            print(f"WARNING: --start-chunk {_FORCE_START_CHUNK} is BEFORE "
+                  f"the checkpoint's next_chunk ({ckpt_next}).")
+            print(f"Chunks {_FORCE_START_CHUNK}..{ckpt_next-1} may already "
+                  f"have rows in the zeros CSV.")
+            print(f"If this is unintentional, abort now (Ctrl+C) and resume "
+                  f"WITHOUT --start-chunk to continue from chunk {ckpt_next}.")
+            print("!"*64)
+            print()
+            # Also check if the zeros CSV actually contains rows for the
+            # start chunk -- if it does, the user is almost certainly
+            # making a mistake.
+            if os.path.exists(ZEROS_LOG):
+                try:
+                    with open(ZEROS_LOG, 'r') as _f:
+                        _header = _f.readline()
+                        if 'chunk' in _header:
+                            _chunk_col = _header.strip().split(',').index('chunk')
+                            for _line in _f:
+                                _parts = _line.strip().split(',')
+                                if (len(_parts) > _chunk_col and
+                                        _parts[_chunk_col].strip() ==
+                                        str(_FORCE_START_CHUNK)):
+                                    print(f"CONFIRMED: zeros CSV already "
+                                          f"contains rows for chunk "
+                                          f"{_FORCE_START_CHUNK}.")
+                                    print(f"Re-running will create DUPLICATES. "
+                                          f"Abort now if this was not intended.")
+                                    print()
+                                    break
+                except Exception:
+                    pass    # can't check, proceed with just the warning
         sc = _FORCE_START_CHUNK
         prev_nz = None            # force a fresh nzeros_a boundary call
         _restore_seam = None      # force a fresh safe_boundary_a call

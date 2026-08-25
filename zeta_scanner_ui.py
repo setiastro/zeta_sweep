@@ -156,7 +156,21 @@ class ScannerUI(QMainWindow):
         # setting state (state affects widget-enabled state, which is fine
         # to compute after values are populated).
         self._load_settings()
-        self._set_state(self.STATE_IDLE)
+
+        # Check if a checkpoint from a prior session exists. If it does
+        # and indicates progress (next_chunk > 0), the user probably wants
+        # to Resume rather than Start (which would re-run from the
+        # start-chunk override). We enter STATE_PAUSED so Resume is
+        # available. This handles the common case of "closed the UI after
+        # a pause, reopened later, want to continue."
+        if self._detect_existing_checkpoint():
+            self._set_state(self.STATE_PAUSED)
+            self.statusBar().showMessage(
+                "Checkpoint found from a prior session. "
+                "Click Resume to continue, or Start to begin fresh "
+                "(Start with start-chunk override will re-run from that chunk).")
+        else:
+            self._set_state(self.STATE_IDLE)
 
         # Elapsed-time ticker (updates the elapsed/ETA labels once a second
         # even between chunks, so the display doesn't look frozen during a
@@ -510,7 +524,11 @@ class ScannerUI(QMainWindow):
             f"font-weight: bold; padding: 4px 12px; color: {colors.get(state, 'black')};")
 
         # Button enable matrix per state
-        can_start  = state in (self.STATE_IDLE,)
+        # Start is available when IDLE or PAUSED. In PAUSED state, Start
+        # means "ignore the checkpoint and start fresh from the configured
+        # start-chunk" -- the user might want this if they need to redo
+        # a range. Resume is the safer option (uses checkpoint's next_chunk).
+        can_start  = state in (self.STATE_IDLE, self.STATE_PAUSED)
         can_resume = state in (self.STATE_PAUSED,)
         can_pause  = state in (self.STATE_RUNNING,)
         can_abort  = state in (self.STATE_RUNNING, self.STATE_PAUSING)
@@ -535,13 +553,19 @@ class ScannerUI(QMainWindow):
         self.btn_reset_cfg.setEnabled(cfg_editable)
 
     # ------------------------- Start / Pause / Resume / Abort -------------------------
-    def _spawn_scanner(self):
+    def _spawn_scanner(self, is_resume=False):
         """Launch the scanner subprocess with current UI config.
 
         Any override checkbox that's checked adds the corresponding CLI flag;
         anything unchecked lets the scanner use its module default. This
         keeps the default UI launch (all checkboxes off) equivalent to just
         running `python zeta_gpu_scan_v6_hp.py` at the command line.
+
+        When is_resume=True, the --start-chunk flag is NEVER passed, even if
+        the override checkbox is checked. Resume means "let the checkpoint's
+        next_chunk take over." The start-chunk override is for the FIRST
+        launch of a distributed work unit, not for subsequent resumes within
+        that work unit.
         """
         script = self.script_edit.text().strip()
         cwd = self.cwd_edit.text().strip() or os.getcwd()
@@ -584,7 +608,7 @@ class ScannerUI(QMainWindow):
         if self.nchunks_override.isChecked():
             argv += ["--n-chunks", str(self.nchunks_edit.value())]
 
-        if self.startchunk_override.isChecked():
+        if self.startchunk_override.isChecked() and not is_resume:
             sc_val = self.startchunk_edit.value()
             # Sanity check: start must be < N_CHUNKS. If the user overrode
             # both, catch the mistake here before the scanner logs 0 chunks.
@@ -597,6 +621,10 @@ class ScannerUI(QMainWindow):
                         f"in [start_chunk, N_CHUNKS), so this range is empty.")
                     return False
             argv += ["--start-chunk", str(sc_val)]
+        elif is_resume:
+            self.output.append(
+                "[UI] Resume: ignoring start-chunk override, letting "
+                "checkpoint's next_chunk take over.")
 
         if self.prefix_override.isChecked():
             pref = self.prefix_edit.text().strip()
@@ -639,8 +667,34 @@ class ScannerUI(QMainWindow):
         return True
 
     def _on_start(self):
-        if self.state != self.STATE_IDLE:
+        if self.state not in (self.STATE_IDLE, self.STATE_PAUSED):
             return
+        # If we're in PAUSED state (checkpoint exists), warn the user that
+        # Start will use the start-chunk override (if checked) and may
+        # re-process already-completed chunks. Resume is usually the right
+        # choice.
+        if self.state == self.STATE_PAUSED:
+            if self.startchunk_override.isChecked():
+                sc_val = self.startchunk_edit.value()
+                msg = (
+                    f"A checkpoint exists from a prior run. Clicking Start "
+                    f"with the start-chunk override will begin at chunk "
+                    f"{sc_val}, which may RE-PROCESS chunks that were already "
+                    f"completed and DUPLICATE rows in the zeros CSV.\n\n"
+                    f"Use RESUME instead to continue from where the checkpoint "
+                    f"left off.\n\n"
+                    f"Are you sure you want to Start from chunk {sc_val}?")
+            else:
+                msg = (
+                    "A checkpoint exists from a prior run. Start will begin "
+                    "from the checkpoint's next_chunk (same as Resume in this "
+                    "case, since no start-chunk override is set).\n\n"
+                    "Continue?")
+            confirm = QMessageBox.question(
+                self, "Start with existing checkpoint?", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
         # Persist the config used to launch this run, so next launch of the
         # UI restores the same setup automatically. Done BEFORE spawn so the
         # config is saved even if spawn fails for some reason.
@@ -672,8 +726,8 @@ class ScannerUI(QMainWindow):
                 os.remove(self.pause_flag_path)
             except OSError:
                 pass
-        self.output.append("[UI] Resuming from checkpoint…")
-        self._spawn_scanner()
+        self.output.append("[UI] Resuming from checkpoint...")
+        self._spawn_scanner(is_resume=True)
 
     def _on_abort(self):
         if self.state not in (self.STATE_RUNNING, self.STATE_PAUSING):
@@ -1022,6 +1076,43 @@ class ScannerUI(QMainWindow):
         s.setValue("window_geometry", self.saveGeometry())
         s.setValue("splitter_state", self.main_splitter.saveState())
         s.sync()   # flush to backend immediately
+
+    def _detect_existing_checkpoint(self):
+        """Check if a checkpoint file from a prior session exists in the
+        working directory. Returns True if the checkpoint shows progress
+        (next_chunk > 0), meaning a Resume makes sense.
+
+        Uses the current UI settings (cwd, prefix) to figure out the
+        checkpoint filename, matching the same logic the scanner uses:
+          - No prefix override: "zeta_scan_v6_1p0e13.json"
+          - Prefix override checked: "{prefix}_checkpoint.json"
+        """
+        cwd = self.cwd_edit.text().strip() or os.getcwd()
+        if self.prefix_override.isChecked():
+            pref = self.prefix_edit.text().strip()
+            if pref:
+                ckpt_name = f"{pref}_checkpoint.json"
+            else:
+                return False    # prefix override on but empty, can't determine file
+        else:
+            ckpt_name = "zeta_scan_v6_1p0e13.json"
+        ckpt_path = os.path.join(cwd, ckpt_name)
+        if not os.path.exists(ckpt_path):
+            return False
+        try:
+            import json
+            with open(ckpt_path) as f:
+                data = json.load(f)
+            nc = data.get("next_chunk", 0)
+            if nc > 0:
+                self.output.append(
+                    f"[UI] Found existing checkpoint: {ckpt_name} "
+                    f"(next_chunk={nc}, zeros_located="
+                    f"{data.get('zeros_located', '?')})")
+                return True
+        except Exception:
+            pass
+        return False
 
     def _reset_settings(self):
         """Wipe all saved settings and reload the coded defaults into the
