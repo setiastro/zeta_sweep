@@ -34,3 +34,6 @@ torch>=1.10        # (tested with 2.2 on RTX 3070 Ti / CUDA 12.1)
 # If you're only running the scanner from the command line, you can skip
 # this install and PyQt6 won't be imported.
 PyQt6>=6.2         # (tested with 6.6)
+
+# matplot for explorer  ui plotting
+matplotlib
