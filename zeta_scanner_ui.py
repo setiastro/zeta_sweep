@@ -891,15 +891,20 @@ class ScannerUI(QMainWindow):
 
     def _on_process_exited(self, code: int):
         self.output.append(f"[UI] Scanner exited with code {code}.")
-        # If we were pausing and the process exited cleanly, we're paused.
-        if self.state == self.STATE_PAUSING:
+        # Transition to the right post-exit state:
+        #   STATE_PAUSING → STATE_PAUSED (normal pause completion)
+        #   STATE_PAUSED  → stay PAUSED  (the "paused" status event already
+        #                   transitioned us; don't clobber it back to IDLE)
+        #   anything else → STATE_IDLE   (abort, natural end, crash)
+        if self.state in (self.STATE_PAUSING, self.STATE_PAUSED):
             self._set_state(self.STATE_PAUSED)
+            self.statusBar().showMessage(
+                f"Paused (scanner exited with code {code}). "
+                "Click Resume to continue.")
         else:
-            # Otherwise (abort, natural end, crash), go back to idle.
             self._set_state(self.STATE_IDLE)
             self.statusBar().showMessage(f"Scanner exited (code {code}). Ready.")
         self.proc = None
-        # Reader thread will finish on its own; nothing to clean up here.
 
     def _update_tightest_pair(self, tp):
         """Populate the tightest-pair widget from a dict payload. Called on
