@@ -77,19 +77,30 @@ class ComputeThread(QThread):
 
     def run(self):
         try:
-            t_vals = np.arange(self.t_center - self.half_width,
-                               self.t_center + self.half_width, self.step)
-            n = len(t_vals)
+            # Work in dt-space (small offsets from t_center) so float64 has
+            # full precision even at t ~ 1e13+. At that height, float64
+            # epsilon is ~0.002, so step sizes below ~0.001 produce
+            # degenerate t_vals if computed as absolute values. Building
+            # the grid as offsets (which are O(1), not O(1e13)) avoids this.
+            dt_vals = np.arange(-self.half_width, self.half_width, self.step)
+            n = len(dt_vals)
             if n < 3:
                 self.error.emit("Too few sample points. Increase half-width "
                                 "or decrease step size.")
                 return
 
+            # Absolute t values for display (these are the best float64 can
+            # do; plots use dt_vals for the x-axis to avoid precision loss).
+            t_vals = self.t_center + dt_vals
+
             # Build argument list with full-precision string representation.
-            # Must convert numpy float64 to Python float first, because
-            # repr(np.float64(x)) produces "np.float64(x)" which mpmath
-            # can't parse.
-            args = [(repr(float(t)), self.dps) for t in t_vals]
+            # Use mpmath to add t_center + dt so the string sent to the
+            # worker carries the full value, not a float64-truncated one.
+            from mpmath import mpf, mp
+            mp.dps = max(self.dps, 30)
+            tc_mpf = mpf(repr(self.t_center))
+            args = [(mp.nstr(tc_mpf + mpf(repr(float(dt))), 30), self.dps)
+                    for dt in dt_vals]
 
             ncpu = max(1, cpu_count() - 1)   # leave 1 core for the UI
             self.progress.emit(0, n)
@@ -133,7 +144,8 @@ class ComputeThread(QThread):
             imin = int(np.argmin(np.abs(z_vals)))
 
             self.finished.emit({
-                't_vals': t_vals, 'z_vals': z_vals,
+                't_vals': t_vals, 'dt_vals': dt_vals,
+                'z_vals': z_vals,
                 'zeta_re': zeta_re, 'zeta_im': zeta_im,
                 's_vals': s_vals, 'imin': imin,
                 't_center': self.t_center,
@@ -360,11 +372,13 @@ class ExplorerUI(QMainWindow):
         self.fig.clear()
 
         t_vals  = r['t_vals'];   z_vals  = r['z_vals']
+        dt_vals = r['dt_vals']   # offset from t_center (full float64 precision)
+        t_center = r['t_center']
         zeta_re = r['zeta_re'];  zeta_im = r['zeta_im']
         s_vals  = r['s_vals'];   imin    = r['imin']
 
-        # Color fraction along t (0..1)
-        cfrac = (t_vals - t_vals[0]) / max(t_vals[-1] - t_vals[0], 1e-30)
+        # Color fraction along t (0..1) -- use dt_vals for precision
+        cfrac = (dt_vals - dt_vals[0]) / max(dt_vals[-1] - dt_vals[0], 1e-30)
 
         def colored_line(ax, x, y, lw=1.4):
             pts = np.array([x, y]).T.reshape(-1, 1, 2)
@@ -386,42 +400,52 @@ class ExplorerUI(QMainWindow):
             ax.grid(True, alpha=0.2, color='#4a5568')
 
         # ---- Panel 1: Z(t) ----
+        # Plot against dt_vals (offsets from t_center) so matplotlib has
+        # full float64 precision on the x-axis even at t ~ 1e13+.
+        # The offset label shows the absolute t reference.
         ax1 = self.fig.add_subplot(2, 2, 1)
-        colored_line(ax1, t_vals, z_vals)
+        colored_line(ax1, dt_vals, z_vals)
         ax1.axhline(0, color='#4a5568', lw=0.7)
-        ax1.scatter([t_vals[imin]], [z_vals[imin]], c='#fc8181', s=50,
+        ax1.scatter([dt_vals[imin]], [z_vals[imin]], c='#fc8181', s=50,
                      zorder=5, edgecolors='white', linewidths=0.6)
-        ax1.set_xlim(t_vals[0], t_vals[-1])
+        ax1.set_xlim(dt_vals[0], dt_vals[-1])
         z_pad = 0.1 * max(abs(z_vals.min()), abs(z_vals.max())) + 0.01
         ax1.set_ylim(z_vals.min() - z_pad, z_vals.max() + z_pad)
         style_ax(ax1,
                  f"Z(t)    tightest |Z| = {abs(z_vals[imin]):.3e} "
                  f"@ t = {t_vals[imin]:.6f}",
                  yl='Z(t)')
+        # Offset annotation so the reader knows absolute t
+        ax1.annotate(f"+{t_center:.6f}", xy=(1, 1),
+                     xycoords='axes fraction', ha='right', va='bottom',
+                     fontsize=7, color='#a0aec0')
 
         # Mark zero crossings
         sc_mask = (z_vals[:-1] >= 0) != (z_vals[1:] >= 0)
         sc_idx = np.nonzero(sc_mask)[0]
         for si in sc_idx:
             za, zb = z_vals[si], z_vals[si+1]
-            ta, tb = t_vals[si], t_vals[si+1]
-            tz = ta - za * (tb - ta) / (zb - za) if zb != za else 0.5*(ta+tb)
-            ax1.axvline(tz, color='#f6e05e', alpha=0.5, lw=0.7)
-            ax1.plot(tz, 0, 'o', color='#f6e05e', markersize=6,
+            da, db = dt_vals[si], dt_vals[si+1]
+            dz = da - za * (db - da) / (zb - za) if zb != za else 0.5*(da+db)
+            ax1.axvline(dz, color='#f6e05e', alpha=0.5, lw=0.7)
+            ax1.plot(dz, 0, 'o', color='#f6e05e', markersize=6,
                       markeredgecolor='#fefcbf', markeredgewidth=0.5, zorder=4)
 
         # ---- Panel 2: S(t) ----
         ax2 = self.fig.add_subplot(2, 2, 3)
-        colored_line(ax2, t_vals, s_vals)
+        colored_line(ax2, dt_vals, s_vals)
         ax2.axhline(0, color='#4a5568', lw=0.7)
         ax2.axhline(2, color='#fc8181', lw=0.9, ls='--', alpha=0.8)
         ax2.axhline(-2, color='#fc8181', lw=0.9, ls='--', alpha=0.8)
-        ax2.text(t_vals[-1], 2.05, '|S| = 2', color='#fc8181', fontsize=8,
+        ax2.text(dt_vals[-1], 2.05, '|S| = 2', color='#fc8181', fontsize=8,
                   ha='right', va='bottom')
-        ax2.set_xlim(t_vals[0], t_vals[-1])
+        ax2.set_xlim(dt_vals[0], dt_vals[-1])
         s_pad = 0.3
         ax2.set_ylim(s_vals.min() - s_pad, s_vals.max() + s_pad)
         style_ax(ax2, 'S(t) = N_observed - N_smooth', xl='t', yl='S(t)')
+        ax2.annotate(f"+{t_center:.6f}", xy=(1, 1),
+                     xycoords='axes fraction', ha='right', va='bottom',
+                     fontsize=7, color='#a0aec0')
 
         # ---- Panel 3: parametric full ----
         ax3 = self.fig.add_subplot(2, 2, 2)
@@ -464,12 +488,16 @@ class ExplorerUI(QMainWindow):
         cbar_ax = self.fig.add_axes([0.91, 0.07, 0.015, 0.87])
         sm = cm.ScalarMappable(
             cmap=self.CMAP,
-            norm=plt.Normalize(vmin=t_vals[0], vmax=t_vals[-1]))
+            norm=plt.Normalize(vmin=dt_vals[0], vmax=dt_vals[-1]))
         sm.set_array([])
         cbar = self.fig.colorbar(sm, cax=cbar_ax)
         cbar.set_label('t (color key across all panels)',
                         color='#a0aec0', fontsize=9)
         cbar.ax.tick_params(colors='#a0aec0', labelsize=8)
+        # Show absolute t reference on the colorbar
+        cbar_ax.annotate(f"+{t_center:.6f}", xy=(0.5, 1.01),
+                         xycoords='axes fraction', ha='center', va='bottom',
+                         fontsize=7, color='#a0aec0')
         self.canvas.draw()
 
     # ---- Save -----------------------------------------------------------
