@@ -1289,6 +1289,18 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
         if _stored_t[_k+1] <= _stored_t[_k]:
             _need[_k] = True
             _need[_k+1] = True
+    # Per-zero bracket override for de-collided zeros. Default None = use the
+    # coarse grid interval (dt_arr[i], dt_arr[i+1]) with its GPU Z values,
+    # which is honest provenance for the vast majority of zeros. For a zero we
+    # re-solve by bisection below, we ALSO record the refined, verified
+    # bracket [_lo,_hi] that provably straddles the zero under mpmath.siegelz,
+    # plus the siegelz values at those endpoints. This keeps the CSV
+    # internally consistent: every row's stored bracket actually brackets its
+    # stored t under the same function a verifier would use -- so a future
+    # de-collision / audit that re-evaluates siegelz at the bracket endpoints
+    # finds a clean sign change instead of a grazing ambiguity.
+    _bracket_override = {}   # kk -> (dt_lo, dt_hi, Z_lo, Z_hi)
+
     _n_decol = 0
     for _kk in np.nonzero(_need)[0]:
         _i = idx[_kk]
@@ -1298,14 +1310,31 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
             _lo = mpf(repr(_a)); _hi = mpf(repr(_b))
             _flo = _f(_lo); _fhi = _f(_hi)
             if (_flo > 0) != (_fhi > 0):
+                # Bisect to refine the zero location. Capture, along the way,
+                # the last bracket that is still WIDER than ~1e-4 in dt -- that
+                # is narrow enough to cleanly straddle only this zero, but wide
+                # enough to survive the %.6f storage format (a fully-collapsed
+                # ~1e-17 bracket would round to dt_left==dt_right and be
+                # useless). We keep refining dt_zero to full precision but
+                # store the wider verified bracket.
+                _br_lo, _br_hi = _lo, _hi
+                _br_zlo, _br_zhi = _flo, _fhi
                 for _ in range(50):
                     _mid = (_lo + _hi) / 2
                     _fm = _f(_mid)
                     if (_flo > 0) != (_fm > 0):
-                        _hi = _mid
+                        _hi = _mid; _fhi = _fm
                     else:
                         _lo = _mid; _flo = _fm
+                    # remember the tightest bracket still >= 1e-4 wide
+                    if float(_hi - _lo) >= 1e-4:
+                        _br_lo, _br_hi = _lo, _hi
+                        _br_zlo, _br_zhi = _flo, _fhi
                 dt_zero[_kk] = float((_lo + _hi) / 2)
+                # Record the verified, %.6f-representable straddling bracket.
+                _bracket_override[_kk] = (
+                    float(_br_lo), float(_br_hi),
+                    float(_br_zlo), float(_br_zhi))
                 _n_decol += 1
         except Exception:
             pass
@@ -1330,9 +1359,18 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
     for k, i in enumerate(idx):
         t_abs = float(t0_mpf + mpf(repr(float(dt_zero[k]))))
         zi = str(baseline_index + 1 + k) if baseline_index is not None else ""
-        rows_out.append(
-            f"{t_abs:.10f},{Z[i]:+.6e},{Z[i+1]:+.6e},"
-            f"{dt_arr[i]:.6f},{dt_arr[i+1]:.6f},{chunk_idx},{zi}\n")
+        if k in _bracket_override:
+            # de-collided zero: store the refined, verified bracket that
+            # provably straddles this zero under siegelz (not the coarse grid
+            # interval, whose endpoint grazed the neighbouring zero).
+            _dl, _dr, _zl, _zr = _bracket_override[k]
+            rows_out.append(
+                f"{t_abs:.10f},{_zl:+.6e},{_zr:+.6e},"
+                f"{_dl:.6f},{_dr:.6f},{chunk_idx},{zi}\n")
+        else:
+            rows_out.append(
+                f"{t_abs:.10f},{Z[i]:+.6e},{Z[i+1]:+.6e},"
+                f"{dt_arr[i]:.6f},{dt_arr[i+1]:.6f},{chunk_idx},{zi}\n")
 
     payload = ("t,Z_left,Z_right,dt_left,dt_right,chunk,zero_index\n"
                if new else "") + "".join(rows_out)
