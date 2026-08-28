@@ -787,7 +787,36 @@ def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None,
     compatible)."""
     with T.time("chunk.safe_boundary_a"):
         if dt_a is None:
-            dt_a = safe_boundary(t0_str, dt_start)
+            if dt_start == 0.0:
+                # CHUNK-0 START FIX. For the very first chunk, safe_boundary
+                # would nudge the left edge UP to a large-|Z| point. If that
+                # nudged point lands ABOVE the first zero over T_BASE, the grid
+                # starts past that zero while the baseline nzeros already
+                # COUNTS it -- so the sweep's first zero is silently skipped
+                # (its ordinal exists but no row is ever written). To guarantee
+                # the first zero is captured, anchor the left edge AT dt=0
+                # (T_BASE) and baseline to nzeros(T_BASE). We only need
+                # |Z(T_BASE)| to be nonzero enough that T_BASE itself isn't a
+                # zero (astronomically unlikely at an integer height, but
+                # checked): if T_BASE grazes a zero, fall back to a SMALL
+                # NEGATIVE nudge (below T_BASE) so recording still starts at or
+                # before the first zero, never above it.
+                _zt0 = abs(float(siegelz(exact_t(t0_str, 0.0))))
+                if _zt0 > 1e-6:
+                    dt_a = 0.0
+                else:
+                    # graze at T_BASE: step DOWN (negative dt) to a safe point
+                    # below T_BASE, so nothing above T_BASE is skipped.
+                    dt_a = 0.0
+                    _k = 1
+                    while _k <= 40:
+                        _d = -_k * 0.004
+                        if abs(float(siegelz(exact_t(t0_str, _d)))) >= 0.20:
+                            dt_a = _d
+                            break
+                        _k += 1
+            else:
+                dt_a = safe_boundary(t0_str, dt_start)
     with T.time("chunk.safe_boundary_b"):
         dt_b = safe_boundary(t0_str, dt_end)
 
