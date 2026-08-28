@@ -358,6 +358,10 @@ If you use this data or code, a citation like the following is appreciated:
 
 The release tag identifies the exact range and code version, so specific claims can be traced to specific dataset versions.
 
+## Computation Contributors
+
+David Chaton
+
 ## Acknowledgments
 
 Built on top of `mpmath`'s excellent implementations of `siegelz`, `siegeltheta`, and `nzeros`. Method inspired by the classical Riemann–Siegel approach combined with modern GPU parallelism for the main sum. Independent verification of the 2020 Platt–Trudgian frontier at heights past 10¹² was the motivating goal; the ordinal-indexed structure was added later so the data would be joinable to other zero catalogs.
