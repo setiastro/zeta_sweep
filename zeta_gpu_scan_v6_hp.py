@@ -1262,25 +1262,113 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
             dt_arr[idx] - Z[idx] * (dt_arr[idx+1] - dt_arr[idx]) / dz,
             0.5*(dt_arr[idx] + dt_arr[idx+1])
         )
+
+    t0_mpf = mpf(t0_str)
+
+    # --- De-collision refinement -----------------------------------------
+    # Linear interpolation is skewed when a bracket endpoint sample lands
+    # almost ON an adjacent zero: that endpoint ~0 pulls the interpolated
+    # crossing toward it, mislocating THIS zero by up to ~STEP. Near a tight
+    # pair, two genuinely distinct zeros can then round -- in float64, which
+    # has only ~2e-3 absolute resolution at 1e13 -- to the SAME stored t,
+    # writing two CSV rows with an identical t. The COUNT stays correct (both
+    # sign-changes fire, both rows written); only the stored LOCATION of one
+    # row is wrong, showing up only as a duplicate-t string in the CSV.
+    #
+    # Robust fix, no magic threshold: the failure condition IS "two stored
+    # float64 t-values collide/invert". Compute the float64 t each zero would
+    # get from linear interp; flag any adjacent pair equal-or-inverted;
+    # re-solve THOSE by confined bisection on the true siegelz within each
+    # zero's own sign-change bracket. Bisection can't leave its bracket, so it
+    # always lands on the correct zero of the pair. Fires iff a collision is
+    # actually possible -- rare, so mpmath cost is negligible.
+    _stored_t = np.array(
+        [float(t0_mpf + mpf(repr(float(dt_zero[k])))) for k in range(len(idx))])
+    _need = np.zeros(len(idx), dtype=bool)
+    for _k in range(len(idx) - 1):
+        if _stored_t[_k+1] <= _stored_t[_k]:
+            _need[_k] = True
+            _need[_k+1] = True
+    _n_decol = 0
+    for _kk in np.nonzero(_need)[0]:
+        _i = idx[_kk]
+        _a = float(dt_arr[_i]); _b = float(dt_arr[_i+1])
+        _f = lambda d: siegelz(exact_t(t0_str, d))
+        try:
+            _lo = mpf(repr(_a)); _hi = mpf(repr(_b))
+            _flo = _f(_lo); _fhi = _f(_hi)
+            if (_flo > 0) != (_fhi > 0):
+                for _ in range(50):
+                    _mid = (_lo + _hi) / 2
+                    _fm = _f(_mid)
+                    if (_flo > 0) != (_fm > 0):
+                        _hi = _mid
+                    else:
+                        _lo = _mid; _flo = _fm
+                dt_zero[_kk] = float((_lo + _hi) / 2)
+                _n_decol += 1
+        except Exception:
+            pass
+    if _n_decol:
+        print(f"    [append] de-collided {_n_decol} tight-pair zero "
+              f"t-value(s) in chunk {chunk_idx} via bisection", flush=True)
+
     # reconstruct absolute t = t0 + dt at full precision, then cast to float64
     # for storage. t0 is a full-precision string; add small dt via mpf then
     # convert. Doing this once per zero is cheap (~10 microseconds each) and
     # gives the correct float64 value for a t that would otherwise lose
     # precision under naive float(t0)+dt at heights >= 1e13.
-    t0_mpf = mpf(t0_str)
     new = not os.path.exists(ZEROS_LOG)
+
+    # --- Durable write + verify ------------------------------------------
+    # Build all rows first, then write with flush+fsync so a pause/kill can't
+    # leave buffered rows unwritten (the silent write-drop bug). After fsync,
+    # re-read the tail and count this chunk's rows actually on disk; return
+    # that VERIFIED count so the caller's completeness check catches a short
+    # write at the source instead of certifying a truncated chunk.
+    rows_out = []
+    for k, i in enumerate(idx):
+        t_abs = float(t0_mpf + mpf(repr(float(dt_zero[k]))))
+        zi = str(baseline_index + 1 + k) if baseline_index is not None else ""
+        rows_out.append(
+            f"{t_abs:.10f},{Z[i]:+.6e},{Z[i+1]:+.6e},"
+            f"{dt_arr[i]:.6f},{dt_arr[i+1]:.6f},{chunk_idx},{zi}\n")
+
+    payload = ("t,Z_left,Z_right,dt_left,dt_right,chunk,zero_index\n"
+               if new else "") + "".join(rows_out)
     with open(ZEROS_LOG, 'a') as f:
-        if new:
-            f.write("t,Z_left,Z_right,dt_left,dt_right,chunk,zero_index\n")
-        for k, i in enumerate(idx):
-            t_abs = float(t0_mpf + mpf(repr(float(dt_zero[k]))))
-            if baseline_index is not None:
-                zi = str(baseline_index + 1 + k)
-            else:
-                zi = ""
-            f.write(f"{t_abs:.10f},{Z[i]:+.6e},{Z[i+1]:+.6e},"
-                    f"{dt_arr[i]:.6f},{dt_arr[i+1]:.6f},{chunk_idx},{zi}\n")
-    return len(idx)
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+
+    written = len(rows_out)
+    try:
+        want_bytes = written * 160 + 65536
+        with open(ZEROS_LOG, 'rb') as vf:
+            vf.seek(0, 2)
+            fsize = vf.tell()
+            vf.seek(max(0, fsize - want_bytes))
+            tail = vf.read().decode('utf-8', errors='replace')
+        verified = 0
+        for line in tail.split('\n'):
+            parts = line.split(',')
+            if len(parts) > 5:
+                try:
+                    if int(parts[5]) == chunk_idx:
+                        verified += 1
+                except ValueError:
+                    pass
+        if verified != written:
+            print(f"[WRITE VERIFY] chunk {chunk_idx}: expected {written} rows "
+                  f"on disk, found {verified} (short {written - verified}). "
+                  f"Completeness check will flag this chunk.", flush=True)
+            return verified
+    except Exception as _e:
+        print(f"[WRITE VERIFY] chunk {chunk_idx}: could not verify write "
+              f"({_e}); proceeding with intended count {written}.", flush=True)
+        return written
+
+    return written
 
 # ---------------- main ----------------
 if __name__ == '__main__':
