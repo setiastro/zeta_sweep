@@ -203,28 +203,15 @@ class _VizCanvas(QWidget):
                     self._flash_until = time.monotonic() + 0.8
 
     def feed_zero(self, ev):
-        # Zeros are emitted AFTER their chunk's @@SAMPLES@@ block (append_zeros
-        # runs after process_chunk), so by the time a zero arrives, its buffer
-        # is already queued or playing. Attach it to that buffer's zero list so
-        # the ticker shows it as playback reaches it. If the buffer isn't found
-        # yet, stash in _pending_zeros and feed_samples picks it up. This does
-        # NOT touch buffer enqueue/switch -- only where a zero gets filed.
-        ch = ev.get("chunk")
-        if self._cur is not None and not self._cur.get("bootstrap") \
-                and self._cur.get("chunk") == ch:
-            self._cur.setdefault("zeros", []).append(ev)
-            self._cur["zeros"].sort(key=lambda z: z.get("dt", 0.0))
-            return
-        for buf in self._queue:
-            if not buf.get("bootstrap") and buf.get("chunk") == ch:
-                buf.setdefault("zeros", []).append(ev)
-                return
-        self._pending_zeros.append(ev)
+        # No longer used: the ticker detects zeros locally from sign changes in
+        # the Z(t) array it plays (see _advance), so the @@ZERO@@ stream isn't
+        # needed for the visual. Kept as a no-op so the reader's signal
+        # connection stays valid. (You can also drop --emit-samples' per-zero
+        # emission entirely on the scanner side if you want to save the bytes.)
+        return
 
     def feed_samples(self, block):
         ch = block.get("chunk")
-        # Any zeros that arrived BEFORE this block (rare); zeros arriving AFTER
-        # attach via feed_zero above.
         zeros = [z for z in self._pending_zeros if z.get("chunk") == ch]
         for z in list(self._pending_zeros):
             if z.get("chunk") == ch:
@@ -272,20 +259,22 @@ class _VizCanvas(QWidget):
         self._cur = self._queue.popleft()
         self._play_i = 0
         self._zero_ptr = 0
-        self._cur["zeros"] = sorted(self._cur.get("zeros", []),
-                                    key=lambda z: z.get("dt", 0.0))
-        # Clear the rolling Z(t) window and spiral trail at every buffer
-        # boundary. Otherwise the window still holds the PREVIOUS buffer's
-        # points, whose absolute t is a huge jump away (bootstrap t~100 -> live
-        # t~1e13, or one chunk to the next 1000 units on). The Z(t) autoscale
-        # spans x0..x1 across that gap, so new points compress into a sliver at
-        # the right edge and the graph looks broken until the old points scroll
-        # out. Clearing makes each buffer draw its own clean data from point 0.
+        # Clear the rolling Z(t) window and spiral trail at each buffer boundary.
+        # Otherwise the window still holds the PREVIOUS buffer's points, whose
+        # absolute t is a huge jump away (bootstrap t~100 -> live t~1e13, or one
+        # chunk to the next 1000 units on). The Z(t) autoscale then spans that
+        # gap and new points crush into a sliver at the right edge until the old
+        # ones scroll out -- the "funky until filled" glitch. Clearing lets each
+        # buffer draw its own clean data from point 0. (Additive: the buffer is
+        # already popped into _cur, so this does not touch the switch logic.)
         self._z_window.clear()
         self._spiral.clear()
-        # Per-sample Gram-law compliance from the buffer's gram marks (each =
-        # [sample_index, parity, holds]; a gram opens a segment to the next).
-        # comp[i]: 1 holds, 0 violates, -1 unknown. Colours the spiral trail.
+        self._cur["zeros"] = sorted(self._cur.get("zeros", []),
+                                    key=lambda z: z.get("dt", 0.0))
+        # Per-sample Gram-law compliance from this buffer's gram marks (each =
+        # [sample_index, parity, holds]; a gram opens a segment running to the
+        # next gram). comp[i]: 1 holds, 0 violates, -1 unknown. Colours the
+        # spiral trail. Additive -- does not affect switching.
         grams = self._cur.get("grams", [])
         _n = len(self._cur.get("dt", []))
         comp = [-1] * _n
@@ -325,22 +314,31 @@ class _VizCanvas(QWidget):
                 self._spiral.append((re[i], im[i], cc))
             if has_z:
                 self._z_window.append((base + dt[i], zt_arr[i]))
-        # zeros reached in this step -> ticker
-        if self._play_i < end and dt:
-            cur_dt = dt[min(end-1, n-1)]
-            zs = self._cur["zeros"]
-            while self._zero_ptr < len(zs) and \
-                    zs[self._zero_ptr].get("dt", 1e18) <= cur_dt:
-                zz = zs[self._zero_ptr]; self._zero_ptr += 1
-                self._on_zero_reached(zz, base)
+        # zeros -> ticker, detected LOCALLY from sign changes in the Z(t) array
+        # we're already playing. A zero sits between samples i and i+1 whenever
+        # Z[i] and Z[i+1] have opposite signs; its location is the linear-interp
+        # crossing. No dependency on any @@ZERO@@ stream, ordinals, or timing --
+        # the data to find zeros is already in this buffer. (Coarse-grid
+        # detection misses sub-step tight pairs, which is fine for a visual.)
+        if has_z and self._play_i < end:
+            hi = min(end, n - 1)
+            for i in range(self._play_i, hi):
+                zl = zt_arr[i]; zr = zt_arr[i+1]
+                if (zl >= 0) != (zr >= 0):        # sign change = a zero here
+                    denom = (zr - zl) or 1e-30
+                    dt_cross = dt[i] - zl * (dt[i+1] - dt[i]) / denom
+                    # Gram compliance of the segment this zero sits in, so the
+                    # ticker row can match the spiral's colour (pink = the zero
+                    # falls in a Gram-law-violating segment).
+                    comp = _comp[i] if (_comp and i < len(_comp)) else -1
+                    self._on_zero_detected(base + dt_cross, comp)
         self._play_i = end
         if self._play_i >= n:
             self._cur = None
         self.update()
 
-    def _on_zero_reached(self, zz, base):
-        dt_abs = base + zz.get("dt", 0.0)
-        self.ticker.appendleft({"ord": zz.get("ord"), "dt": dt_abs,
+    def _on_zero_detected(self, t_abs, comp=-1):
+        self.ticker.appendleft({"dt": t_abs, "comp": comp,
                                 "bootstrap": self._cur.get("bootstrap", False)})
 
     # ---- paint -----------------------------------------------------------
@@ -512,20 +510,25 @@ class _VizCanvas(QWidget):
         p.setPen(QPen(_VIZ_GRID, 1))
         p.drawLine(QPointF(r.left()+16, r.top()+100),
                    QPointF(r.right()-16, r.top()+100))
-        y = r.top() + 114
-        p.setFont(QFont("JetBrains Mono", 9))
+        # section header -- so "t =" isn't repeated on every row below
+        p.setFont(QFont("Inter", 8, QFont.Weight.DemiBold)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.top()+108, r.width()-32, 14),
+                   Qt.AlignmentFlag.AlignLeft, "DETECTED ZEROS  (t)")
+        y = r.top() + 128
+        p.setFont(QFont("JetBrains Mono", 10))
         for row in self.ticker:
             if y > r.bottom() - 30: break
             boot = row.get("bootstrap")
-            oid = row.get("ord")
-            oid_s = f"#{oid:,}" if isinstance(oid, int) else "#—"
-            p.setPen(_VIZ_INKDIM)
-            p.drawText(QRectF(r.left()+16, y, 120, 16),
-                       Qt.AlignmentFlag.AlignLeft, oid_s)
-            p.setPen(_VIZ_TRACED if boot else _VIZ_TRACE)
-            p.drawText(QRectF(r.left()+120, y, r.width()-130, 16),
-                       Qt.AlignmentFlag.AlignLeft, f"{row.get('dt',0):.4f}")
-            y += 19
+            t_abs = row.get("dt", 0.0)
+            # pink when this zero sits in a Gram-law-violating segment (comp==0),
+            # matching the spiral's magenta there; otherwise the normal colour.
+            if row.get("comp") == 0:
+                p.setPen(_VIZ_GRAMBAD)
+            else:
+                p.setPen(_VIZ_TRACED if boot else _VIZ_TRACE)
+            p.drawText(QRectF(r.left()+16, y, r.width()-24, 16),
+                       Qt.AlignmentFlag.AlignLeft, f"{t_abs:.4f}")
+            y += 20
         p.setFont(QFont("Inter", 8, QFont.Weight.DemiBold)); p.setPen(_VIZ_INKDIM)
         p.drawText(QRectF(r.left()+16, r.bottom()-24, r.width()-32, 16),
                    Qt.AlignmentFlag.AlignLeft, "SETIASTRO")
