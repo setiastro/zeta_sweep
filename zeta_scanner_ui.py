@@ -38,13 +38,15 @@ Layout (approximate):
   [ Live output pane (scrollable, auto-follow) ]
 """
 
-import sys, os, json, time, subprocess, signal, re
+import sys, os, json, time, subprocess, signal, re, math
 from pathlib import Path
 from decimal import Decimal, getcontext
 from datetime import datetime, timedelta
+from collections import deque
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
-from PyQt6.QtGui import QFont, QTextCursor, QAction
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings, QPointF, QRectF
+from PyQt6.QtGui import (QFont, QTextCursor, QAction, QPainter, QColor, QPen,
+                         QBrush, QRadialGradient, QPainterPath, QPixmap)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox,
@@ -56,8 +58,12 @@ from PyQt6.QtWidgets import (
 # --------------------------------------------------------------------------
 # Configuration constants (UI defaults; can be overridden in the UI itself)
 # --------------------------------------------------------------------------
-SCANNER_SCRIPT_DEFAULT = "zeta_gpu_scan_v6_hp.py"
+SCANNER_SCRIPT_DEFAULT = "zeta_gpu_scan_v7_hp.py"
 STATUS_TAG = "@@STATUS@@ "                # must match _STATUS_TAG in scanner
+SAMPLE_TAG = "@@SAMPLES@@ "              # must match _SAMPLE_TAG in scanner
+ZERO_TAG   = "@@ZERO@@ "                # must match _ZERO_TAG in scanner
+EMIT_FLAG_NAME = "emit.flag"             # credit flag the UI grants
+BOOTSTRAP_FILE = "bootstrap.json"        # precomputed cold-start data
 LIVE_OUTPUT_MAX_LINES = 10_000            # scrollback cap in the text pane
 PAUSE_FLAG_NAME = "pause.flag"            # created/deleted in cwd
 
@@ -68,6 +74,463 @@ PAUSE_FLAG_NAME = "pause.flag"            # created/deleted in cwd
 # QSettings() constructor runs.
 SETTINGS_ORG = "SetiAstro"
 SETTINGS_APP = "ZetaSweepUI"
+
+
+# --------------------------------------------------------------------------
+# Live visualization (native Qt painting -- no QtWebEngine dependency)
+# --------------------------------------------------------------------------
+# A separate window animating the scanner's progress from the SAME
+# @@STATUS@@ events the main UI parses. No scanner changes: it consumes
+# run_start / chunk_end dicts via feed(). Three panels, one shared clock:
+#   CENTER  RH frontier scatter -- every record-tight pair (min norm_gap)
+#           as norm_gap vs t, with a staircase frontier line; the current
+#           record glows and the panel flashes magenta on a new record.
+#   BOTTOM  rate heartbeat -- rate_t_per_s scrolling, the machine's pulse.
+#   LEFT    discovery ticker -- chunks dropping in with zero counts, the
+#           cumulative total, and a magenta mark on each record break.
+# Magenta is reserved strictly for record-breaking tight pairs, so it
+# means the same thing every time it fires.
+# --------------------------------------------------------------------------
+
+_VIZ_VOID   = QColor(7, 11, 20)
+_VIZ_GRID   = QColor(21, 32, 51)
+_VIZ_TRACE  = QColor(255, 179, 71)     # phosphor amber
+_VIZ_TRACED = QColor(138, 106, 58)
+_VIZ_INK    = QColor(201, 214, 232)
+_VIZ_INKDIM = QColor(95, 122, 156)
+_VIZ_ALERT  = QColor(255, 61, 139)     # record-break magenta -- nowhere else
+_VIZ_OKC    = QColor(63, 208, 160)     # rate trace teal
+_VIZ_GRAMOK = QColor(80, 220, 130)     # Gram's law holds (green)
+_VIZ_GRAMBAD= QColor(255, 90, 150)     # Gram's law violated (magenta-pink)
+
+
+class ZetaVizWindow(QMainWindow):
+    """Top-level live visualization window. Consumes the V7 sample stream:
+      * feed_samples(block) -- a chunk's full-resolution Z(t) grid
+      * feed_zero(ev)       -- one located zero (dt-offset + ordinal)
+      * feed_status(ev)     -- run_start / chunk_end (for rate + record flash)
+    and grants scanner credits (touches the emit-flag) when ready for the next
+    buffer. Until the first live buffer arrives it loops precomputed bootstrap
+    data so the window is never dead. grant_first_credit() should be called
+    once the scanner is launched so the first chunk emits."""
+    creditReady = pyqtSignal()           # ask the UI to touch the emit flag
+
+    def __init__(self, parent=None, bootstrap_path=None):
+        super().__init__(parent)
+        self.setWindowTitle("zeta_sweep - live visualization")
+        self.resize(1150, 720)
+        self._canvas = _VizCanvas(self, bootstrap_path=bootstrap_path)
+        self._canvas.creditReady.connect(self.creditReady)
+        self.setCentralWidget(self._canvas)
+
+    def feed_samples(self, block):  self._canvas.feed_samples(block)
+    def feed_zero(self, ev):        self._canvas.feed_zero(ev)
+    def feed_status(self, ev):      self._canvas.feed_status(ev)
+    def reset(self):                self._canvas.reset()
+
+
+class _VizCanvas(QWidget):
+    """Plays one chunk-buffer of samples at a time as synchronized panels,
+    then asks for the next. CENTER: the parametric zeta(1/2+it) spiral -- the
+    curve loops the origin once per zero; tight pairs pinch near the origin.
+    Drawn at full resolution so the fine winding survives. BOTTOM: S(t), the
+    argument-count fluctuation, the real thing (NOT scan rate). LEFT: the
+    discovery ticker of zeros with their global ordinals. Until the first live
+    buffer arrives it loops precomputed bootstrap data (which carries re/im and
+    s directly), so the correct visuals show during the cold start too."""
+    creditReady = pyqtSignal()
+
+    def __init__(self, parent=None, bootstrap_path=None):
+        super().__init__(parent)
+        self.setMinimumSize(720, 460)
+
+        # buffer queue: each item carries the full arrays for one chunk:
+        #   {"dt":[], "re":[], "im":[], "s":[] or None, "zeros":[], "base":,
+        #    "chunk":, "bootstrap":bool}
+        self._queue = deque()
+        self._cur = None
+        self._play_i = 0
+        self._zero_ptr = 0
+        self._pending_zeros = deque()
+
+        # display state
+        self.zeros_total = 0
+        self.best_ngap = None
+        self.session_records = 0
+        self.ticker = deque(maxlen=80)
+        self._flash_until = 0.0
+        self._first_live_seen = False
+
+        # parametric spiral trail: recent (re, im) points. Short so old data
+        # fades quickly and the current loop reads clearly (1/4 of prior 4000).
+        self._spiral = deque(maxlen=1000)
+        # Z(t) rolling window: (dt_abs, z) for the bottom trace
+        self._z_window = deque(maxlen=2400)
+
+        # bootstrap data (looped until first live buffer)
+        self._bootstrap = None
+        if bootstrap_path:
+            try:
+                with open(bootstrap_path, "r") as f:
+                    self._bootstrap = json.load(f)
+            except Exception:
+                self._bootstrap = None
+        self._load_bootstrap_buffer()
+
+        # Separate playback speeds (samples advanced per ~33ms tick). Bootstrap
+        # stays lively; live plays slower so the dense 1e13 winding is watchable.
+        # Lower = slower. These only affect draw pace, never the switching/credit
+        # logic below.
+        self._playspeed_bootstrap = 10
+        self._playspeed_live = 4
+        self._anim = QTimer(self)
+        self._anim.timeout.connect(self._advance)
+        self._anim.start(33)
+
+    # ---- external feeds --------------------------------------------------
+    def feed_status(self, ev):
+        k = ev.get("event", "")
+        if k == "chunk_end":
+            zt = ev.get("zeros_located_total")
+            if zt is not None:
+                try: self.zeros_total = int(zt)
+                except (TypeError, ValueError): pass
+            tp = ev.get("tightest")
+            if isinstance(tp, dict) and tp.get("norm_gap") is not None:
+                ng = float(tp["norm_gap"])
+                if self.best_ngap is None or ng < self.best_ngap:
+                    self.best_ngap = ng
+                    self.session_records += 1
+                    self._flash_until = time.monotonic() + 0.8
+
+    def feed_zero(self, ev):
+        # Zeros are emitted AFTER their chunk's @@SAMPLES@@ block (append_zeros
+        # runs after process_chunk), so by the time a zero arrives its buffer is
+        # already queued or playing. Attach it to that buffer's zero list so it
+        # shows in the ticker as playback reaches it. If the buffer isn't found
+        # (zero arrived before its samples, or samples were dropped), stash it
+        # in _pending_zeros and feed_samples will pick it up.
+        ch = ev.get("chunk")
+        # currently-playing buffer?
+        if self._cur is not None and not self._cur.get("bootstrap") \
+                and self._cur.get("chunk") == ch:
+            self._cur.setdefault("zeros", []).append(ev)
+            # keep the play-position's zero list sorted so _advance finds it
+            self._cur["zeros"].sort(key=lambda z: z.get("dt", 0.0))
+            return
+        # a queued buffer?
+        for buf in self._queue:
+            if not buf.get("bootstrap") and buf.get("chunk") == ch:
+                buf.setdefault("zeros", []).append(ev)
+                return
+        # not found yet -> stash for feed_samples
+        self._pending_zeros.append(ev)
+
+    def feed_samples(self, block):
+        ch = block.get("chunk")
+        # collect any zeros that arrived BEFORE this block (rare -- usually they
+        # come after). Zeros that arrive after attach via feed_zero above.
+        zeros = [z for z in self._pending_zeros if z.get("chunk") == ch]
+        for z in list(self._pending_zeros):
+            if z.get("chunk") == ch:
+                self._pending_zeros.remove(z)
+        # Use .get() -- a block may lack re/im (a fine-resweep Z with no theta
+        # stash). We still enqueue it so live data flows; the spiral just won't
+        # draw for that one block while Z(t) still does. A hard block["re"]
+        # here would raise KeyError inside the Qt slot, silently drop the
+        # buffer, and leave the viz stuck looping bootstrap forever.
+        buf = {"dt": block.get("dt", []),
+               "re": block.get("re", []), "im": block.get("im", []),
+               "z": block.get("z", []), "base": float(block.get("base", 1e13)),
+               "chunk": ch, "zeros": zeros, "bootstrap": False,
+               "grams": block.get("grams", [])}
+        if not self._first_live_seen:
+            self._first_live_seen = True
+            self._queue.clear(); self._cur = None
+        self._queue.append(buf)
+
+    def reset(self):
+        self._queue.clear(); self._cur = None; self._play_i = 0
+        self._first_live_seen = False
+        self._spiral.clear(); self._z_window.clear()
+        self._load_bootstrap_buffer()
+
+    # ---- bootstrap -------------------------------------------------------
+    def _load_bootstrap_buffer(self):
+        if not self._bootstrap:
+            return
+        b = self._bootstrap
+        buf = {"dt": b.get("dt", []), "re": b.get("re", []),
+               "im": b.get("im", []), "z": b.get("z", []),
+               "base": 0.0, "chunk": None,
+               "zeros": b.get("zeros", []), "bootstrap": True,
+               "grams": b.get("grams", [])}
+        self._queue.append(buf)
+
+    # ---- playback engine -------------------------------------------------
+    def _start_next_buffer(self):
+        if not self._queue:
+            if not self._first_live_seen:
+                self._load_bootstrap_buffer()
+            if not self._queue:
+                return
+        self._cur = self._queue.popleft()
+        self._play_i = 0
+        self._zero_ptr = 0
+        self._cur["zeros"] = sorted(self._cur.get("zeros", []),
+                                    key=lambda z: z.get("dt", 0.0))
+        # Build a per-sample Gram-compliance array from the buffer's gram marks.
+        # Each gram = [sample_index, parity, holds]; a gram opens a segment that
+        # runs until the next gram. compliance[i] in {1 holds, 0 violates, -1
+        # unknown/before first gram}. Used to colour the spiral trail.
+        grams = self._cur.get("grams", [])
+        n = len(self._cur.get("dt", []))
+        comp = [-1] * n
+        if grams and n:
+            for gi in range(len(grams)):
+                start_idx = grams[gi][0]
+                end_idx = grams[gi+1][0] if gi+1 < len(grams) else n
+                holds = grams[gi][2]
+                for i in range(max(0, start_idx), min(n, end_idx)):
+                    comp[i] = holds
+        self._cur["_comp"] = comp
+        if not self._cur.get("bootstrap"):
+            self.creditReady.emit()
+
+    def _advance(self):
+        if self._cur is None:
+            self._start_next_buffer()
+            if self._cur is None:
+                self.update(); return
+        dt = self._cur["dt"]; re = self._cur["re"]; im = self._cur["im"]
+        zt_arr = self._cur.get("z") or []
+        base = self._cur["base"]
+        n = len(dt)
+        # spiral needs re/im aligned; Z(t) needs z aligned. Draw whichever are
+        # present -- a block missing re/im (rare fine-resweep) still shows Z(t).
+        has_spiral = (len(re) == n and len(im) == n)
+        has_z = (len(zt_arr) == n)
+        if n == 0 or (not has_spiral and not has_z):
+            self._cur = None; self.update(); return
+        _speed = self._playspeed_bootstrap if self._cur.get("bootstrap") \
+            else self._playspeed_live
+        end = min(n, self._play_i + _speed)
+        _comp = self._cur.get("_comp")
+        for i in range(self._play_i, end):
+            if has_spiral:
+                cc = _comp[i] if (_comp and i < len(_comp)) else -1
+                self._spiral.append((re[i], im[i], cc))
+            if has_z:
+                self._z_window.append((base + dt[i], zt_arr[i]))
+        # zeros reached in this step -> ticker
+        if self._play_i < end and dt:
+            cur_dt = dt[min(end-1, n-1)]
+            zs = self._cur["zeros"]
+            while self._zero_ptr < len(zs) and \
+                    zs[self._zero_ptr].get("dt", 1e18) <= cur_dt:
+                zz = zs[self._zero_ptr]; self._zero_ptr += 1
+                self._on_zero_reached(zz, base)
+        self._play_i = end
+        if self._play_i >= n:
+            self._cur = None
+        self.update()
+
+    def _on_zero_reached(self, zz, base):
+        dt_abs = base + zz.get("dt", 0.0)
+        self.ticker.appendleft({"ord": zz.get("ord"), "dt": dt_abs,
+                                "bootstrap": self._cur.get("bootstrap", False)})
+
+    # ---- paint -----------------------------------------------------------
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, _VIZ_VOID)
+        lw = max(240, int(W * 0.22))
+        bh = max(120, int(H * 0.22))
+        self._paint_ticker(p, QRectF(0, 0, lw, H))
+        self._paint_spiral(p, QRectF(lw, 0, W - lw, H - bh))
+        self._paint_z(p, QRectF(lw, H - bh, W - lw, bh))
+        p.setPen(QPen(_VIZ_GRID, 1))
+        p.drawLine(lw, 0, lw, H); p.drawLine(lw, H - bh, W, H - bh)
+        now = time.monotonic()
+        if now < self._flash_until:
+            a = (self._flash_until - now) / 0.8
+            g = QRadialGradient(lw + (W-lw)*0.5, (H-bh)*0.45, (W-lw)*0.4)
+            c = QColor(_VIZ_ALERT); c.setAlphaF(0.16*a)
+            g.setColorAt(0, c); g.setColorAt(1, QColor(255,61,139,0))
+            p.fillRect(QRectF(lw, 0, W-lw, H-bh), QBrush(g))
+        p.end()
+
+    def _paint_spiral(self, p, r):
+        p.save(); p.setClipRect(r)
+        boot = (self._cur.get("bootstrap") if self._cur else False)
+        p.setFont(QFont("Inter", 8, QFont.Weight.DemiBold)); p.setPen(_VIZ_INKDIM)
+        label = "zeta(1/2 + it)  -  parametric" + \
+                ("   (bootstrap)" if boot else "")
+        p.drawText(QRectF(r.left()+16, r.top()+10, r.width()-32, 18),
+                   Qt.AlignmentFlag.AlignLeft, label)
+        if len(self._spiral) < 2:
+            p.setPen(_VIZ_INKDIM); p.setFont(QFont("JetBrains Mono", 10))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "warming up...")
+            p.restore(); return
+        pts = list(self._spiral)
+        # autoscale to the recent trail, centered on origin (points are
+        # (re, im, compliance); compliance in {1 holds, 0 violates, -1 unknown})
+        mx = max(1e-6, max(abs(pt[0]) for pt in pts))
+        my = max(1e-6, max(abs(pt[1]) for pt in pts))
+        m = max(mx, my) * 1.1
+        cx = r.center().x(); cy = r.center().y()
+        R = min(r.width(), r.height()) * 0.42 / m
+        # graticule: axes + origin
+        p.setPen(QPen(_VIZ_GRID, 1))
+        p.drawLine(QPointF(cx - r.width()*0.42, cy),
+                   QPointF(cx + r.width()*0.42, cy))
+        p.drawLine(QPointF(cx, r.top()+28), QPointF(cx, r.bottom()-8))
+        p.setBrush(QBrush(_VIZ_INK)); p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx, cy), 2, 2)     # origin
+        # axis scale ticks: a "nice" unit fitting the current autoscale, marked
+        # on the Re and Im axes with labels, so the loop size is readable.
+        def _nice_unit(v):
+            import math as _m
+            if v <= 0: return 1.0
+            e = _m.floor(_m.log10(v)); b = 10**e; f = v/b
+            return (1 if f < 2 else (2 if f < 5 else 5)) * b
+        unit = _nice_unit(m * 0.75)
+        p.setFont(QFont("JetBrains Mono", 7))
+        for sgn in (1, -1):
+            xt = cx + sgn*unit*R
+            if abs(xt-cx) > 8 and r.left() < xt < r.right():
+                p.setPen(QPen(_VIZ_GRID, 1))
+                p.drawLine(QPointF(xt, cy-4), QPointF(xt, cy+4))
+                p.setPen(_VIZ_INKDIM)
+                p.drawText(QRectF(xt-24, cy+6, 48, 12),
+                           Qt.AlignmentFlag.AlignCenter, f"{sgn*unit:g}")
+            yt = cy - sgn*unit*R
+            if abs(yt-cy) > 8 and r.top() < yt < r.bottom():
+                p.setPen(QPen(_VIZ_GRID, 1))
+                p.drawLine(QPointF(cx-4, yt), QPointF(cx+4, yt))
+                p.setPen(_VIZ_INKDIM)
+                p.drawText(QRectF(cx+7, yt-7, 40, 14),
+                           Qt.AlignmentFlag.AlignLeft, f"{sgn*unit:g}i")
+        # trail: colour each segment by Gram-law compliance of its sample.
+        # green = Gram's law holds, magenta = violates, amber = unknown (pre-
+        # first-gram or bootstrap without gram data). Fade older segments out.
+        flashing = time.monotonic() < self._flash_until
+        npts = len(pts)
+        for i in range(1, npts):
+            ax, ay = pts[i-1][0], pts[i-1][1]
+            bx, by = pts[i][0], pts[i][1]
+            comp = pts[i][2]
+            age = i / npts
+            if flashing:
+                col = QColor(_VIZ_ALERT)
+            elif comp == 0:
+                col = QColor(_VIZ_GRAMBAD)   # violation
+            elif comp == 1:
+                col = QColor(_VIZ_GRAMOK)     # holds
+            else:
+                col = QColor(_VIZ_TRACE)      # unknown
+            col.setAlphaF(0.15 + 0.8*age)
+            p.setPen(QPen(col, 0.5 + 1.6*age))
+            p.drawLine(QPointF(cx + ax*R, cy - ay*R),
+                       QPointF(cx + bx*R, cy - by*R))
+        # leading dot
+        lx, ly = pts[-1][0], pts[-1][1]
+        p.setBrush(QBrush(_VIZ_ALERT if flashing else QColor(255,217,160)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx + lx*R, cy - ly*R), 3.2, 3.2)
+        # readouts: current |zeta| and the autoscale extent (loop size)
+        p.setFont(QFont("JetBrains Mono", 9)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.right()-200, r.top()+10, 184, 16),
+                   Qt.AlignmentFlag.AlignRight,
+                   f"|zeta| {(lx*lx+ly*ly)**0.5:.4f}")
+        p.setPen(_VIZ_TRACED)
+        p.drawText(QRectF(r.right()-200, r.top()+26, 184, 14),
+                   Qt.AlignmentFlag.AlignRight, f"view +/-{m:.3g}")
+        p.restore()
+
+    def _paint_z(self, p, r):
+        p.save(); p.setClipRect(r)
+        p.setFont(QFont("Inter", 8, QFont.Weight.DemiBold)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.top()+8, r.width()-32, 16),
+                   Qt.AlignmentFlag.AlignLeft, "Z(t)  -  Riemann-Siegel")
+        if len(self._z_window) < 2:
+            p.restore(); return
+        pts = list(self._z_window)
+        x0 = pts[0][0]; x1 = pts[-1][0]; span = max(1e-9, x1 - x0)
+        zmax = max(2.0, max(abs(v) for _, v in pts) * 1.1)
+        mid = r.center().y() + 6
+        amp = (r.height() - 46) * 0.5
+        # zero line -- every zeta zero is where the trace crosses this
+        p.setPen(QPen(_VIZ_GRID, 1))
+        p.drawLine(QPointF(r.left()+16, mid), QPointF(r.right()-16, mid))
+        def X(t): return r.left()+16 + (t-x0)/span*(r.width()-32)
+        def Y(v): return mid - (v/zmax)*amp
+        flashing = time.monotonic() < self._flash_until
+        p.setPen(QPen(_VIZ_ALERT if flashing else _VIZ_TRACE, 1.4))
+        path = QPainterPath(); first = True
+        for (t, v) in pts:
+            xx, yy = X(t), Y(v)
+            if first: path.moveTo(xx, yy); first=False
+            else: path.lineTo(xx, yy)
+        p.drawPath(path)
+        # leading dot
+        lt, lv = pts[-1]
+        p.setBrush(QBrush(_VIZ_TRACE)); p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(X(lt), Y(lv)), 3.0, 3.0)
+        # axis readouts: the t window shown, and the Z vertical scale
+        p.setFont(QFont("JetBrains Mono", 7)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.bottom()-13, r.width()*0.6, 12),
+                   Qt.AlignmentFlag.AlignLeft,
+                   f"t: {x0:.2f} -> {x1:.2f}  (dt {x1-x0:.2f})")
+        p.drawText(QRectF(r.right()-120, r.top()+8, 104, 12),
+                   Qt.AlignmentFlag.AlignRight, f"Z: +/-{zmax:.2g}")
+        p.restore()
+
+    def _paint_ticker(self, p, r):
+        p.save(); p.setClipRect(r)
+        p.setFont(QFont("Inter", 11, QFont.Weight.Bold)); p.setPen(_VIZ_INK)
+        p.drawText(QRectF(r.left()+16, r.top()+16, r.width()-32, 20),
+                   Qt.AlignmentFlag.AlignLeft, "zeta_sweep")
+        p.setFont(QFont("JetBrains Mono", 8)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.top()+40, r.width()-32, 16),
+                   Qt.AlignmentFlag.AlignLeft,
+                   f"zeros located   {self.zeros_total:,}")
+        p.setPen(_VIZ_ALERT if self.session_records else _VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.top()+58, r.width()-32, 16),
+                   Qt.AlignmentFlag.AlignLeft,
+                   f"records broken  {self.session_records}")
+        if self.best_ngap is not None:
+            p.setPen(_VIZ_INKDIM)
+            p.drawText(QRectF(r.left()+16, r.top()+76, r.width()-32, 16),
+                       Qt.AlignmentFlag.AlignLeft,
+                       f"tightest ngap   {self.best_ngap:.6f}")
+        p.setPen(QPen(_VIZ_GRID, 1))
+        p.drawLine(QPointF(r.left()+16, r.top()+100),
+                   QPointF(r.right()-16, r.top()+100))
+        y = r.top() + 114
+        p.setFont(QFont("JetBrains Mono", 9))
+        for row in self.ticker:
+            if y > r.bottom() - 30: break
+            boot = row.get("bootstrap")
+            oid = row.get("ord")
+            oid_s = f"#{oid:,}" if isinstance(oid, int) else "#—"
+            p.setPen(_VIZ_INKDIM)
+            p.drawText(QRectF(r.left()+16, y, 120, 16),
+                       Qt.AlignmentFlag.AlignLeft, oid_s)
+            p.setPen(_VIZ_TRACED if boot else _VIZ_TRACE)
+            p.drawText(QRectF(r.left()+120, y, r.width()-130, 16),
+                       Qt.AlignmentFlag.AlignLeft, f"{row.get('dt',0):.4f}")
+            y += 19
+        p.setFont(QFont("Inter", 8, QFont.Weight.DemiBold)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.bottom()-24, r.width()-32, 16),
+                   Qt.AlignmentFlag.AlignLeft, "SETIASTRO")
+        p.restore()
+
+
+
+
 
 
 # --------------------------------------------------------------------------
@@ -84,6 +547,8 @@ SETTINGS_APP = "ZetaSweepUI"
 class ScannerReader(QThread):
     lineReceived = pyqtSignal(str)
     statusReceived = pyqtSignal(dict)
+    sampleReceived = pyqtSignal(dict)    # @@SAMPLES@@ dense Z(t) block
+    zeroReceived = pyqtSignal(dict)      # @@ZERO@@ per-zero event
     processExited = pyqtSignal(int)      # exit code
 
     def __init__(self, proc, parent=None):
@@ -100,14 +565,25 @@ class ScannerReader(QThread):
                     break
                 line = line.rstrip("\r\n")
                 if line.startswith(STATUS_TAG):
-                    payload = line[len(STATUS_TAG):]
                     try:
-                        event = json.loads(payload)
-                        self.statusReceived.emit(event)
+                        self.statusReceived.emit(
+                            json.loads(line[len(STATUS_TAG):]))
                     except json.JSONDecodeError:
-                        # malformed status -- log to text pane anyway so the
-                        # user sees it, but don't try to route as an event
                         self.lineReceived.emit(line)
+                elif line.startswith(SAMPLE_TAG):
+                    # dense Z(t) block: route to the viz, do NOT mirror to the
+                    # text pane (it's ~1.6 MB and would flood the scrollback).
+                    try:
+                        self.sampleReceived.emit(
+                            json.loads(line[len(SAMPLE_TAG):]))
+                    except json.JSONDecodeError:
+                        pass
+                elif line.startswith(ZERO_TAG):
+                    try:
+                        self.zeroReceived.emit(
+                            json.loads(line[len(ZERO_TAG):]))
+                    except json.JSONDecodeError:
+                        pass
                 else:
                     self.lineReceived.emit(line)
         except Exception as e:
@@ -331,6 +807,13 @@ class ScannerUI(QMainWindow):
         btn_row.addWidget(self.btn_pause)
         btn_row.addWidget(self.btn_resume)
         btn_row.addWidget(self.btn_abort)
+        # Live visualization window (opens on demand; fed from _on_status).
+        self._viz = None
+        self.btn_viz = QPushButton("Show Visualizations")
+        self.btn_viz.setMinimumWidth(150)
+        self.btn_viz.setMinimumHeight(32)
+        self.btn_viz.clicked.connect(self._open_viz)
+        btn_row.addWidget(self.btn_viz)
         btn_row.addStretch(1)
         self.state_label = QLabel("State: idle")
         self.state_label.setStyleSheet("font-weight: bold; padding: 4px 12px;")
@@ -594,6 +1077,19 @@ class ScannerUI(QMainWindow):
                 "--json-progress",
                 "--pause-flag", self.pause_flag_path]
 
+        # V7 live-visualization sample emission. Always pass the flag + path;
+        # the scanner only actually emits when the UI has granted a credit
+        # (dropped the emit flag file), which the viz window does when it's
+        # open and ready. So with the viz closed, no credit is ever granted
+        # and the scanner emits nothing -- zero overhead, exactly like v6.
+        self.emit_flag_path = os.path.join(cwd, EMIT_FLAG_NAME)
+        try:
+            if os.path.exists(self.emit_flag_path):
+                os.remove(self.emit_flag_path)   # clear stale credit
+        except OSError:
+            pass
+        argv += ["--emit-samples", "--emit-flag", self.emit_flag_path]
+
         # --- Config-override flags (only when the checkbox is on) ---
         if self.tbase_override.isChecked():
             tbase_txt = self.tbase_edit.text().strip()
@@ -657,6 +1153,8 @@ class ScannerUI(QMainWindow):
         self.reader = ScannerReader(self.proc)
         self.reader.lineReceived.connect(self._on_line)
         self.reader.statusReceived.connect(self._on_status)
+        self.reader.sampleReceived.connect(self._on_sample)
+        self.reader.zeroReceived.connect(self._on_zero)
         self.reader.processExited.connect(self._on_process_exited)
         self.reader.start()
 
@@ -664,6 +1162,10 @@ class ScannerUI(QMainWindow):
         self.chunks_completed_this_run = 0
         self._set_state(self.STATE_RUNNING)
         self.statusBar().showMessage(f"Scanner started (PID {self.proc.pid}).")
+        # If the viz window is already open, grant the first emit credit now
+        # that emit_flag_path exists, so the first chunk streams its samples.
+        if self._viz is not None:
+            self._grant_credit()
         return True
 
     def _on_start(self):
@@ -765,6 +1267,75 @@ class ScannerUI(QMainWindow):
         cursor = self.output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.output.setTextCursor(cursor)
+
+    def _open_viz(self):
+        """Open (or re-focus) the live visualization window. It plays the V7
+        sample stream: full-resolution Z(t), the S(t)/zeros staircase, and the
+        ticker. Until the first live buffer arrives it loops precomputed
+        bootstrap data. Opening the window grants the scanner its first emit
+        credit, so the next chunk begins streaming samples."""
+        if self._viz is None:
+            cwd = os.path.dirname(os.path.abspath(__file__))
+            boot = os.path.join(cwd, BOOTSTRAP_FILE)
+            self._viz = ZetaVizWindow(
+                self, bootstrap_path=boot if os.path.exists(boot) else None)
+            # credit handshake: the viz asks for a buffer -> we touch the flag.
+            self._viz.creditReady.connect(self._grant_credit)
+        self._viz.show()
+        self._viz.raise_()
+        self._viz.activateWindow()
+        # grant the first credit so the next chunk emits (if a scan is running)
+        self._grant_credit()
+        # Safety net: the credit handshake can stall if a grant is missed (a
+        # race between flag creation and the scanner's chunk-top check, or a
+        # buffer-finish re-grant that didn't fire). A slow timer re-grants when
+        # the viz is idle (no live buffer queued or playing) so it self-heals
+        # instead of freezing on bootstrap. Cheap: touches a file every 3s only
+        # while the viz is open AND a scan is running AND nothing is queued.
+        if not hasattr(self, "_credit_timer"):
+            self._credit_timer = QTimer(self)
+            self._credit_timer.timeout.connect(self._credit_safety_net)
+            self._credit_timer.start(3000)
+
+    def _credit_safety_net(self):
+        if self._viz is None:
+            return
+        if getattr(self, "emit_flag_path", None) is None:
+            return
+        if self.state != self.STATE_RUNNING:
+            return
+        c = self._viz._canvas
+        # If we have no live buffer waiting and aren't currently playing a live
+        # buffer, we're idle w.r.t. the scanner -> make sure a credit is out.
+        playing_live = (c._cur is not None and not c._cur.get("bootstrap"))
+        has_queued_live = any(not b.get("bootstrap") for b in c._queue)
+        if not playing_live and not has_queued_live:
+            # only (re)grant if the flag isn't already sitting there uneaten
+            path = self.emit_flag_path
+            if not os.path.exists(path):
+                self._grant_credit()
+
+    def _grant_credit(self):
+        """Create the emit-flag file: 'scanner, please fill one buffer.' The
+        scanner consumes (deletes) it when a chunk emits; the viz calls this
+        again once it's finished playing that buffer. No-op if no scan is
+        running (flag path unset)."""
+        path = getattr(self, "emit_flag_path", None)
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+
+    def _on_sample(self, block: dict):
+        if self._viz is not None:
+            self._viz.feed_samples(block)
+
+    def _on_zero(self, ev: dict):
+        if self._viz is not None:
+            self._viz.feed_zero(ev)
 
     def _on_status(self, event: dict):
         # Route each event to its widget update
@@ -888,6 +1459,14 @@ class ScannerUI(QMainWindow):
             self.statusBar().showMessage(
                 f"Run complete: {zloc:,} zeros located. "
                 + ("All accounted for." if complete else "SHORT -- see logs."))
+
+        # Forward every event to the live visualization window if it's open.
+        # feed() ignores kinds it doesn't use, and self-paces its own repaint,
+        # so this is cheap even during a burst of chunk_end events.
+        # Forward status events to the live visualization (rate, records).
+        # Sample/zero streams go through _on_sample/_on_zero separately.
+        if self._viz is not None:
+            self._viz.feed_status(event)
 
     def _on_process_exited(self, code: int):
         self.output.append(f"[UI] Scanner exited with code {code}.")

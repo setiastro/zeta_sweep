@@ -30,7 +30,7 @@ of pool.map times and the wall time of that phase -- point at where the
 CPU or GPU is sitting on its hands.
 """
 
-import os, json, time, argparse, sys
+import os, json, time, argparse, sys, math
 import numpy as np
 from datetime import datetime
 from contextlib import contextmanager
@@ -366,6 +366,113 @@ MP_WORKERS     = 36
 _JSON_PROGRESS = False           # set by CLI parse; default OFF
 _PAUSE_FLAG_PATH = None          # set by CLI parse; default OFF
 _STATUS_TAG = "@@STATUS@@ "      # UI parses lines starting with this tag
+
+# ---- V7 sample emission (for the live visualizer) ------------------------
+# The scanner computes the full Z(t) array and every zero's dt/ordinal inside
+# process_chunk, then discards them. The visualizer wants them. Rather than
+# stream continuously (which would flood the pipe and couple the viz to the
+# scan's pace), we use a CREDIT-GATED, one-buffer-per-chunk scheme:
+#
+#   * The UI grants a "credit" by creating a small flag file (--emit-flag).
+#     Presence of the flag == "I have a free buffer, please fill one."
+#   * At the TOP of each chunk the scanner does a single non-blocking check:
+#     if sample emission is enabled AND the credit flag exists, this chunk
+#     will emit its samples; otherwise it emits nothing and pays nothing.
+#   * When a chunk emits, it CONSUMES the credit (deletes the flag). The UI
+#     re-creates the flag once it has finished visualizing that buffer and is
+#     ready for another. So the scanner races ahead but only ever emits when
+#     the viz has signalled it can keep up -- the scan's hot path never waits.
+#
+# When --emit-samples is off (the default, and every headless/coordinator
+# run), _EMIT_SAMPLES is False and every hook below is a single boolean test
+# that returns immediately. V6 behaviour is byte-identical.
+_EMIT_SAMPLES = False            # set by CLI parse; default OFF
+_EMIT_FLAG_PATH = None           # UI-managed credit flag; default OFF
+_SAMPLE_TAG = "@@SAMPLES@@ "     # dense Z(t) block, one per emitting chunk
+_ZERO_TAG   = "@@ZERO@@ "        # per-zero event (dt, ordinal, norm_gap)
+_emit_this_chunk = False         # decided at chunk top by the credit check
+
+def _emit_credit_available():
+    """Non-blocking: is sample emission enabled AND has the UI granted a
+    credit (flag file present)? Called once per chunk at the top. Cheap:
+    a bool test, then at most one os.path.exists when enabled."""
+    if not _EMIT_SAMPLES or _EMIT_FLAG_PATH is None:
+        return False
+    try:
+        return os.path.exists(_EMIT_FLAG_PATH)
+    except OSError:
+        return False
+
+def _consume_emit_credit():
+    """Delete the credit flag so this chunk is the only one to fill a buffer
+    until the UI grants another. Safe if the flag's already gone."""
+    try:
+        if _EMIT_FLAG_PATH and os.path.exists(_EMIT_FLAG_PATH):
+            os.remove(_EMIT_FLAG_PATH)
+    except OSError:
+        pass
+
+def _emit_samples_block(dt_arr, Z, t_base, chunk_idx):
+    """Emit the FULL-resolution dense block for one chunk -- every grid point,
+    no downsampling. At 1e13 the interesting structure (the near-origin
+    pinches of tight pairs, the fine winding of the spiral) lives in the detail
+    BETWEEN coarse samples, so throwing points away would smear exactly what
+    the visual exists to show. One block per chunk, minutes apart, a few MB --
+    bandwidth is not the constraint, fidelity is.
+
+    Emits, per point: dt-offset (small, float64-safe), Z(t), and the parametric
+    zeta(1/2+it) as re/im. The parametric is the primary visual (the spiral),
+    reconstructed as zeta(1/2+it) = Z(t) * e^{-i theta(t)} using the theta
+    array stashed by the just-completed compute_Z_array -- so re = Z*cos(theta),
+    im = -Z*sin(theta). No recompute. If theta isn't available (e.g. a fine
+    resweep produced this Z), we still emit dt/z and the UI falls back to the
+    Z(t) trace for that block."""
+    n = len(dt_arr)
+    if n == 0:
+        return
+    dts = [round(float(dt_arr[i]), 6) for i in range(n)]
+    zs  = [round(float(Z[i]), 6)      for i in range(n)]
+    payload = {"chunk": int(chunk_idx), "base": float(t_base),
+               "n": n, "dt": dts, "z": zs}
+    th = _LAST_THETA_ARR
+    if th is not None and len(th) == n:
+        res = [round(float(Z[i]) * math.cos(float(th[i])), 6) for i in range(n)]
+        ims = [round(-float(Z[i]) * math.sin(float(th[i])), 6) for i in range(n)]
+        payload["re"] = res
+        payload["im"] = ims
+        # Gram's law support. A Gram point g_n is where theta(g_n) = n*pi, and
+        # the law holds when (-1)^n Z(g_n) > 0. theta is enormous at 1e13, so
+        # rather than emit it, we find the Gram points HERE (where floor(theta/
+        # pi) steps up) and emit just their sample index, their n's parity, and
+        # whether the law holds there. That's a few hundred entries per chunk,
+        # not 100k. The UI colours each loop by the compliance of the Gram
+        # point that opens it.
+        grams = []   # [sample_index, parity(0/1), holds(1/0)]
+        prev_fl = math.floor(float(th[0]) / math.pi)
+        for i in range(1, n):
+            fl = math.floor(float(th[i]) / math.pi)
+            if fl > prev_fl:
+                # a Gram point g_{fl} lies between i-1 and i; use i as its mark.
+                # law: (-1)^fl * Z(g) > 0. Z at the crossing ~ Z[i].
+                parity = fl & 1
+                zc = float(Z[i])
+                holds = 1 if (((-1) ** parity) * zc) > 0 else 0
+                grams.append([i, parity, holds])
+                prev_fl = fl
+        if grams:
+            payload["grams"] = grams
+    print(_SAMPLE_TAG + json.dumps(payload, separators=(",", ":")), flush=True)
+
+def _emit_zero(dt, ordinal, norm_gap=None, chunk_idx=None):
+    """Emit one located zero for the ticker / S(t) staircase: its dt-offset,
+    global ordinal, and (if known) the local normalised gap. Small and one
+    per zero, so cheap even at a few thousand zeros per chunk."""
+    payload = {"dt": round(float(dt), 6), "ord": int(ordinal)}
+    if norm_gap is not None:
+        payload["ng"] = round(float(norm_gap), 6)
+    if chunk_idx is not None:
+        payload["chunk"] = int(chunk_idx)
+    print(_ZERO_TAG + json.dumps(payload, separators=(",", ":")), flush=True)
 
 def _emit_status(event, **kwargs):
     """Emit a structured status event. No-op when --json-progress is off, so
@@ -727,7 +834,16 @@ def compute_Z_array(t0_str, dt_arr, pool, hp=True):
         main = gpu_main_sum_hp(dt_arr, theta_mod_arr, N_arr, r_n, ln_n, t0)
     with T.time("zbuild.final_add"):
         result = main + R_arr
+    # V7: stash the full-precision theta array from THIS build so the sample
+    # emitter can reconstruct the parametric zeta(1/2+it) = Z * e^{-i theta}
+    # without recomputing theta (which would be slow) or changing this
+    # function's return signature (which every caller depends on). Only read
+    # by _emit_samples_block, and only on credited chunks. Harmless otherwise.
+    global _LAST_THETA_ARR
+    _LAST_THETA_ARR = theta_arr
     return result
+
+_LAST_THETA_ARR = None   # set by compute_Z_array; used by _emit_samples_block
 
 def count_sign_changes(Z):
     return int(np.sum((Z[:-1] >= 0) != (Z[1:] >= 0)))
@@ -765,7 +881,7 @@ def verify_violation(t0_str, dt_approx, kind, dps=100):
 
 # ---------------- chunk ----------------
 def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None,
-                  nz_pool=None, fine_step=None):
+                  nz_pool=None, fine_step=None, chunk_idx=None):
     """Timed splits inside a chunk:
         chunk.safe_boundary_a  | chunk.safe_boundary_b
         chunk.build_dt_grid    | chunk.compute_Z_array (already broken out)
@@ -846,6 +962,18 @@ def process_chunk(t0_str, dt_start, dt_end, step, pool, dt_a=None, nz_ta=None,
 
     with T.time("chunk.compute_Z_array"):
         Z = compute_Z_array(t0_str, dt_arr, pool)
+
+    # ---- V7: if this chunk was granted an emit credit (decided by the caller
+    # at chunk top and passed in via _emit_this_chunk), stream its dense Z(t)
+    # samples now. No-op when sample emission is off. The credit was already
+    # consumed at the top, so exactly one chunk fills one buffer per grant.
+    if _emit_this_chunk:
+        try:
+            _ci = chunk_idx if chunk_idx is not None \
+                else int(round(dt_start / CHUNK_T))
+            _emit_samples_block(dt_arr, Z, float(T_BASE), _ci)
+        except Exception:
+            pass   # emission must never break a scan
 
     # ---- Resolve async nzeros results (or fall back to sequential). The
     # timers still fire and measure the RESIDUAL wait time -- if nzeros
@@ -1385,6 +1513,7 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
     # that VERIFIED count so the caller's completeness check catches a short
     # write at the source instead of certifying a truncated chunk.
     rows_out = []
+    _emit_z = _emit_this_chunk   # snapshot: this chunk was granted a credit
     for k, i in enumerate(idx):
         t_abs = float(t0_mpf + mpf(repr(float(dt_zero[k]))))
         zi = str(baseline_index + 1 + k) if baseline_index is not None else ""
@@ -1400,6 +1529,14 @@ def append_zeros(t0_str, dt_arr, Z, chunk_idx, baseline_index=None):
             rows_out.append(
                 f"{t_abs:.10f},{Z[i]:+.6e},{Z[i+1]:+.6e},"
                 f"{dt_arr[i]:.6f},{dt_arr[i+1]:.6f},{chunk_idx},{zi}\n")
+        # V7: emit this zero for the ticker / S(t) staircase (dt-offset +
+        # ordinal). Only when the chunk holds an emit credit; no-op otherwise.
+        if _emit_z and baseline_index is not None:
+            try:
+                _emit_zero(float(dt_zero[k]), baseline_index + 1 + k,
+                           chunk_idx=chunk_idx)
+            except Exception:
+                pass
 
     payload = ("t,Z_left,Z_right,dt_left,dt_right,chunk,zero_index\n"
                if new else "") + "".join(rows_out)
@@ -1448,6 +1585,17 @@ if __name__ == '__main__':
              "'@@STATUS@@ ') for UI/coordinator consumption.")
     _parser.add_argument("--pause-flag", type=str, default=None, metavar="PATH",
         help="between chunks, exit cleanly if PATH exists (checkpoint safe).")
+    # ---- V7 live-visualization sample emission (default OFF) ----
+    _parser.add_argument("--emit-samples", action="store_true",
+        help="V7: when a credit is granted (see --emit-flag), stream a "
+             "downsampled Z(t) block ('@@SAMPLES@@ ') and per-zero events "
+             "('@@ZERO@@ ') for the UI visualizer. OFF by default; when off, "
+             "adds no scan overhead and behaviour is identical to v6.")
+    _parser.add_argument("--emit-flag", type=str, default=None, metavar="PATH",
+        help="V7: credit flag file. The UI creates it to grant one buffer; "
+             "the scanner emits one chunk's samples then deletes it. Required "
+             "for --emit-samples to actually emit (no flag path -> never "
+             "emits, so a headless run stays silent even with --emit-samples).")
 
     # ---- Config overrides (compose freely; any subset OK) ----
     # These let a UI or a distributed coordinator drive the scanner without
@@ -1484,6 +1632,9 @@ if __name__ == '__main__':
     _args = _parser.parse_args()
     _JSON_PROGRESS = _args.json_progress
     _PAUSE_FLAG_PATH = _args.pause_flag
+    # V7 sample emission wiring (all default OFF -> no behaviour change)
+    _EMIT_SAMPLES = bool(_args.emit_samples)
+    _EMIT_FLAG_PATH = _args.emit_flag
 
     # ---- Apply config overrides in dependency order ----
     # T_BASE and CHUNK_T are needed to interpret --start-chunk (they define
@@ -1677,10 +1828,23 @@ if __name__ == '__main__':
                 dt_start=dt_start, dt_end=dt_end)
             wall0=time.time()
 
+            # ---- V7: decide ONCE, at the top of this chunk, whether it will
+            # emit visualization samples. True only if --emit-samples is on AND
+            # the UI has granted a credit (flag file present). Consuming the
+            # credit here means exactly one chunk fills one buffer per grant;
+            # the UI re-grants after it finishes visualizing that buffer. When
+            # emission is off this is a single bool test -> no scan overhead.
+            # (No `global` needed: this loop runs at module scope under
+            # __main__, so assigning here already writes the module global that
+            # process_chunk / append_zeros read.)
+            _emit_this_chunk = _emit_credit_available()
+            if _emit_this_chunk:
+                _consume_emit_credit()
+
             with T.time("main.process_chunk"):
                 hits,viols,found,required,refined,seam,nz_seam,dt_final,Z_final,nz_ta_used = process_chunk(
                     t0_str, dt_start, dt_end, STEP, pool,
-                    dt_a=prev_seam, nz_ta=prev_nz, nz_pool=nz_pool)
+                    dt_a=prev_seam, nz_ta=prev_nz, nz_pool=nz_pool, chunk_idx=c)
 
             prev_seam = seam
             prev_nz = nz_seam
