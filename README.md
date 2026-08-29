@@ -336,6 +336,11 @@ If you want to help extend this catalog further: open an issue on the repo to co
 
 ---
 
+## Computation Contributors
+
+-David Chaton
+-Martin Gibbs - Other published works by Gibbs: DOI: 10.1016/j.bios.2014.09.036 https://www.sciencedirect.com/science/article/abs/pii/S0956566314007234
+
 ## Explicit non-claims
 
 - **Zeros outside the swept range are not addressed.** This dataset says nothing about any zero of ζ(s) with imaginary part outside [10¹³, 10¹³ + 223,999.95].
@@ -357,10 +362,6 @@ If you use this data or code, a citation like the following is appreciated:
 > Marek, F. (SetiAstro). *zeta_sweep: GPU-accelerated Riemann–Siegel Z-function sweep with ordinal-indexed completeness certification.* GitHub, 2026. https://github.com/setiastro/zeta_sweep. Dataset: release `zeta_1e13+224kT`.
 
 The release tag identifies the exact range and code version, so specific claims can be traced to specific dataset versions.
-
-## Computation Contributors
-
-David Chaton
 
 ## Acknowledgments
 
