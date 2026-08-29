@@ -338,8 +338,8 @@ If you want to help extend this catalog further: open an issue on the repo to co
 
 ## Computation Contributors
 
--David Chaton
--Martin Gibbs - Other published works by Gibbs: DOI: 10.1016/j.bios.2014.09.036 https://www.sciencedirect.com/science/article/abs/pii/S0956566314007234
+- David Chaton
+- Martin Gibbs - Other published works by Gibbs: DOI: 10.1016/j.bios.2014.09.036 https://www.sciencedirect.com/science/article/abs/pii/S0956566314007234
 
 ## Explicit non-claims
 
