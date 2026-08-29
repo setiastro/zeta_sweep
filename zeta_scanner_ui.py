@@ -161,8 +161,7 @@ class _VizCanvas(QWidget):
         self._flash_until = 0.0
         self._first_live_seen = False
 
-        # parametric spiral trail: recent (re, im) points. Short so old data
-        # fades quickly and the current loop reads clearly (1/4 of prior 4000).
+        # parametric spiral trail: recent (re, im) points
         self._spiral = deque(maxlen=1000)
         # Z(t) rolling window: (dt_abs, z) for the bottom trace
         self._z_window = deque(maxlen=2400)
@@ -205,31 +204,27 @@ class _VizCanvas(QWidget):
 
     def feed_zero(self, ev):
         # Zeros are emitted AFTER their chunk's @@SAMPLES@@ block (append_zeros
-        # runs after process_chunk), so by the time a zero arrives its buffer is
-        # already queued or playing. Attach it to that buffer's zero list so it
-        # shows in the ticker as playback reaches it. If the buffer isn't found
-        # (zero arrived before its samples, or samples were dropped), stash it
-        # in _pending_zeros and feed_samples will pick it up.
+        # runs after process_chunk), so by the time a zero arrives, its buffer
+        # is already queued or playing. Attach it to that buffer's zero list so
+        # the ticker shows it as playback reaches it. If the buffer isn't found
+        # yet, stash in _pending_zeros and feed_samples picks it up. This does
+        # NOT touch buffer enqueue/switch -- only where a zero gets filed.
         ch = ev.get("chunk")
-        # currently-playing buffer?
         if self._cur is not None and not self._cur.get("bootstrap") \
                 and self._cur.get("chunk") == ch:
             self._cur.setdefault("zeros", []).append(ev)
-            # keep the play-position's zero list sorted so _advance finds it
             self._cur["zeros"].sort(key=lambda z: z.get("dt", 0.0))
             return
-        # a queued buffer?
         for buf in self._queue:
             if not buf.get("bootstrap") and buf.get("chunk") == ch:
                 buf.setdefault("zeros", []).append(ev)
                 return
-        # not found yet -> stash for feed_samples
         self._pending_zeros.append(ev)
 
     def feed_samples(self, block):
         ch = block.get("chunk")
-        # collect any zeros that arrived BEFORE this block (rare -- usually they
-        # come after). Zeros that arrive after attach via feed_zero above.
+        # Any zeros that arrived BEFORE this block (rare); zeros arriving AFTER
+        # attach via feed_zero above.
         zeros = [z for z in self._pending_zeros if z.get("chunk") == ch]
         for z in list(self._pending_zeros):
             if z.get("chunk") == ch:
@@ -279,19 +274,27 @@ class _VizCanvas(QWidget):
         self._zero_ptr = 0
         self._cur["zeros"] = sorted(self._cur.get("zeros", []),
                                     key=lambda z: z.get("dt", 0.0))
-        # Build a per-sample Gram-compliance array from the buffer's gram marks.
-        # Each gram = [sample_index, parity, holds]; a gram opens a segment that
-        # runs until the next gram. compliance[i] in {1 holds, 0 violates, -1
-        # unknown/before first gram}. Used to colour the spiral trail.
+        # Clear the rolling Z(t) window and spiral trail at every buffer
+        # boundary. Otherwise the window still holds the PREVIOUS buffer's
+        # points, whose absolute t is a huge jump away (bootstrap t~100 -> live
+        # t~1e13, or one chunk to the next 1000 units on). The Z(t) autoscale
+        # spans x0..x1 across that gap, so new points compress into a sliver at
+        # the right edge and the graph looks broken until the old points scroll
+        # out. Clearing makes each buffer draw its own clean data from point 0.
+        self._z_window.clear()
+        self._spiral.clear()
+        # Per-sample Gram-law compliance from the buffer's gram marks (each =
+        # [sample_index, parity, holds]; a gram opens a segment to the next).
+        # comp[i]: 1 holds, 0 violates, -1 unknown. Colours the spiral trail.
         grams = self._cur.get("grams", [])
-        n = len(self._cur.get("dt", []))
-        comp = [-1] * n
-        if grams and n:
+        _n = len(self._cur.get("dt", []))
+        comp = [-1] * _n
+        if grams and _n:
             for gi in range(len(grams)):
-                start_idx = grams[gi][0]
-                end_idx = grams[gi+1][0] if gi+1 < len(grams) else n
+                s_idx = grams[gi][0]
+                e_idx = grams[gi+1][0] if gi+1 < len(grams) else _n
                 holds = grams[gi][2]
-                for i in range(max(0, start_idx), min(n, end_idx)):
+                for i in range(max(0, s_idx), min(_n, e_idx)):
                     comp[i] = holds
         self._cur["_comp"] = comp
         if not self._cur.get("bootstrap"):
@@ -375,8 +378,8 @@ class _VizCanvas(QWidget):
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, "warming up...")
             p.restore(); return
         pts = list(self._spiral)
-        # autoscale to the recent trail, centered on origin (points are
-        # (re, im, compliance); compliance in {1 holds, 0 violates, -1 unknown})
+        # autoscale to the recent trail, centered on origin. points are
+        # (re, im, compliance): compliance 1 holds, 0 violates, -1 unknown.
         mx = max(1e-6, max(abs(pt[0]) for pt in pts))
         my = max(1e-6, max(abs(pt[1]) for pt in pts))
         m = max(mx, my) * 1.1
@@ -413,9 +416,9 @@ class _VizCanvas(QWidget):
                 p.setPen(_VIZ_INKDIM)
                 p.drawText(QRectF(cx+7, yt-7, 40, 14),
                            Qt.AlignmentFlag.AlignLeft, f"{sgn*unit:g}i")
-        # trail: colour each segment by Gram-law compliance of its sample.
-        # green = Gram's law holds, magenta = violates, amber = unknown (pre-
-        # first-gram or bootstrap without gram data). Fade older segments out.
+        # trail: colour each segment by Gram-law compliance of its sample --
+        # green holds, magenta-pink violates, amber unknown. A record-break
+        # flash overrides briefly. Older segments fade.
         flashing = time.monotonic() < self._flash_until
         npts = len(pts)
         for i in range(1, npts):
@@ -426,11 +429,11 @@ class _VizCanvas(QWidget):
             if flashing:
                 col = QColor(_VIZ_ALERT)
             elif comp == 0:
-                col = QColor(_VIZ_GRAMBAD)   # violation
+                col = QColor(_VIZ_GRAMBAD)
             elif comp == 1:
-                col = QColor(_VIZ_GRAMOK)     # holds
+                col = QColor(_VIZ_GRAMOK)
             else:
-                col = QColor(_VIZ_TRACE)      # unknown
+                col = QColor(_VIZ_TRACE)
             col.setAlphaF(0.15 + 0.8*age)
             p.setPen(QPen(col, 0.5 + 1.6*age))
             p.drawLine(QPointF(cx + ax*R, cy - ay*R),
