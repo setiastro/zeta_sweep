@@ -349,11 +349,15 @@ class _VizCanvas(QWidget):
         p.fillRect(0, 0, W, H, _VIZ_VOID)
         lw = max(240, int(W * 0.22))
         bh = max(120, int(H * 0.22))
+        sw = (W - lw) * 0.5
         self._paint_ticker(p, QRectF(0, 0, lw, H))
-        self._paint_spiral(p, QRectF(lw, 0, W - lw, H - bh))
-        self._paint_z(p, QRectF(lw, H - bh, W - lw, bh))
+        self._paint_spiral(p, QRectF(lw, 0, sw, H - bh))
+        self._paint_spiral_fixed(p, QRectF(lw + sw, 0, W - lw - sw, H - bh))
+        self._paint_z(p, QRectF(lw, H - bh, sw, bh))
+        self._paint_z_fixed(p, QRectF(lw + sw, H - bh, W - lw - sw, bh))
         p.setPen(QPen(_VIZ_GRID, 1))
         p.drawLine(lw, 0, lw, H); p.drawLine(lw, H - bh, W, H - bh)
+        p.drawLine(int(lw + sw), 0, int(lw + sw), H)
         now = time.monotonic()
         if now < self._flash_until:
             a = (self._flash_until - now) / 0.8
@@ -487,6 +491,145 @@ class _VizCanvas(QWidget):
                    f"t: {x0:.2f} -> {x1:.2f}  (dt {x1-x0:.2f})")
         p.drawText(QRectF(r.right()-120, r.top()+8, 104, 12),
                    Qt.AlignmentFlag.AlignRight, f"Z: +/-{zmax:.2g}")
+        p.restore()
+
+    def _paint_spiral_fixed(self, p, r):
+        # Copy of _paint_spiral with the scale hard-clamped to +/-1.0 (no
+        # autoscale) so origin-close structure stays visible when the main
+        # spiral zooms out. Everything else identical to the original.
+        p.save(); p.setClipRect(r)
+        boot = (self._cur.get("bootstrap") if self._cur else False)
+        p.setFont(QFont("Inter", 8, QFont.Weight.DemiBold)); p.setPen(_VIZ_INKDIM)
+        label = "zeta(1/2 + it)  -  fixed +/-1" + \
+                ("   (bootstrap)" if boot else "")
+        p.drawText(QRectF(r.left()+16, r.top()+10, r.width()-32, 18),
+                   Qt.AlignmentFlag.AlignLeft, label)
+        if len(self._spiral) < 2:
+            p.setPen(_VIZ_INKDIM); p.setFont(QFont("JetBrains Mono", 10))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "warming up...")
+            p.restore(); return
+        pts = list(self._spiral)
+        m = 1.0
+        cx = r.center().x(); cy = r.center().y()
+        R = min(r.width(), r.height()) * 0.42 / m
+        # graticule: axes + origin
+        p.setPen(QPen(_VIZ_GRID, 1))
+        p.drawLine(QPointF(cx - r.width()*0.42, cy),
+                   QPointF(cx + r.width()*0.42, cy))
+        p.drawLine(QPointF(cx, r.top()+28), QPointF(cx, r.bottom()-8))
+        p.setBrush(QBrush(_VIZ_INK)); p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx, cy), 2, 2)     # origin
+        def _nice_unit(v):
+            import math as _m
+            if v <= 0: return 1.0
+            e = _m.floor(_m.log10(v)); b = 10**e; f = v/b
+            return (1 if f < 2 else (2 if f < 5 else 5)) * b
+        unit = _nice_unit(m * 0.75)
+        p.setFont(QFont("JetBrains Mono", 7))
+        for sgn in (1, -1):
+            xt = cx + sgn*unit*R
+            if abs(xt-cx) > 8 and r.left() < xt < r.right():
+                p.setPen(QPen(_VIZ_GRID, 1))
+                p.drawLine(QPointF(xt, cy-4), QPointF(xt, cy+4))
+                p.setPen(_VIZ_INKDIM)
+                p.drawText(QRectF(xt-24, cy+6, 48, 12),
+                           Qt.AlignmentFlag.AlignCenter, f"{sgn*unit:g}")
+            yt = cy - sgn*unit*R
+            if abs(yt-cy) > 8 and r.top() < yt < r.bottom():
+                p.setPen(QPen(_VIZ_GRID, 1))
+                p.drawLine(QPointF(cx-4, yt), QPointF(cx+4, yt))
+                p.setPen(_VIZ_INKDIM)
+                p.drawText(QRectF(cx+7, yt-7, 40, 14),
+                           Qt.AlignmentFlag.AlignLeft, f"{sgn*unit:g}i")
+        flashing = time.monotonic() < self._flash_until
+        npts = len(pts)
+        for i in range(1, npts):
+            ax, ay = pts[i-1][0], pts[i-1][1]
+            bx, by = pts[i][0], pts[i][1]
+            comp = pts[i][2]
+            age = i / npts
+            if flashing:
+                col = QColor(_VIZ_ALERT)
+            elif comp == 0:
+                col = QColor(_VIZ_GRAMBAD)
+            elif comp == 1:
+                col = QColor(_VIZ_GRAMOK)
+            else:
+                col = QColor(_VIZ_TRACE)
+            col.setAlphaF(0.15 + 0.8*age)
+            p.setPen(QPen(col, 0.5 + 1.6*age))
+            p.drawLine(QPointF(cx + ax*R, cy - ay*R),
+                       QPointF(cx + bx*R, cy - by*R))
+        lx, ly = pts[-1][0], pts[-1][1]
+        p.setBrush(QBrush(_VIZ_ALERT if flashing else QColor(255,217,160)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx + lx*R, cy - ly*R), 3.2, 3.2)
+        p.setFont(QFont("JetBrains Mono", 9)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.right()-200, r.top()+10, 184, 16),
+                   Qt.AlignmentFlag.AlignRight,
+                   f"|zeta| {(lx*lx+ly*ly)**0.5:.4f}")
+        p.setPen(_VIZ_TRACED)
+        p.drawText(QRectF(r.right()-200, r.top()+26, 184, 14),
+                   Qt.AlignmentFlag.AlignRight, f"fixed +/-{m:g}")
+        p.restore()
+
+    def _paint_z_fixed(self, p, r):
+        # Copy of _paint_z with the Y scale hard-clamped to +/-1.0 and the t
+        # window sliced to the last quarter of the rolling buffer, so
+        # zero-crossings stay visible when the main heartbeat zooms out to fit
+        # a wild swing. Everything else identical to the original.
+        p.save(); p.setClipRect(r)
+        p.setFont(QFont("Inter", 8, QFont.Weight.DemiBold)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.top()+8, r.width()-32, 16),
+                   Qt.AlignmentFlag.AlignLeft, "Z(t)  -  zoom  (1/4 dt, +/-1)")
+        if len(self._z_window) < 2:
+            p.restore(); return
+        pts_all = list(self._z_window)
+        t_last = pts_all[-1][0]; t_first = pts_all[0][0]
+        full_span = t_last - t_first
+        if full_span > 0:
+            cutoff = t_last - 0.25 * full_span
+            pts = [pt for pt in pts_all if pt[0] >= cutoff]
+            if len(pts) < 2:
+                pts = pts_all[-2:]
+        else:
+            pts = pts_all
+        x0 = pts[0][0]; x1 = pts[-1][0]; span = max(1e-9, x1 - x0)
+        zmax = 1.0
+        mid = r.center().y() + 6
+        amp = (r.height() - 46) * 0.5
+        p.setPen(QPen(_VIZ_GRID, 1))
+        p.drawLine(QPointF(r.left()+16, mid), QPointF(r.right()-16, mid))
+        def X(t): return r.left()+16 + (t-x0)/span*(r.width()-32)
+        def Y(v): return mid - (v/zmax)*amp
+        flashing = time.monotonic() < self._flash_until
+        p.setPen(QPen(_VIZ_ALERT if flashing else _VIZ_TRACE, 1.4))
+        # Break the path across off-scale samples instead of clamping to
+        # rails, so we never draw a false flat line hiding zero-crossings.
+        path = QPainterPath(); pen_down = False
+        for (t, v) in pts:
+            if abs(v) > zmax:
+                pen_down = False
+                continue
+            xx, yy = X(t), Y(v)
+            if not pen_down:
+                path.moveTo(xx, yy); pen_down = True
+            else:
+                path.lineTo(xx, yy)
+        p.drawPath(path)
+        # leading dot: solid if in-view, hollow when off-scale
+        lt, lv = pts[-1]
+        if abs(lv) > zmax:
+            p.setBrush(Qt.BrushStyle.NoBrush); p.setPen(QPen(_VIZ_TRACE, 1.2))
+        else:
+            p.setBrush(QBrush(_VIZ_TRACE)); p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(X(lt), Y(lv)), 3.0, 3.0)
+        p.setFont(QFont("JetBrains Mono", 7)); p.setPen(_VIZ_INKDIM)
+        p.drawText(QRectF(r.left()+16, r.bottom()-13, r.width()*0.6, 12),
+                   Qt.AlignmentFlag.AlignLeft,
+                   f"t: {x0:.2f} -> {x1:.2f}  (dt {x1-x0:.2f})")
+        p.drawText(QRectF(r.right()-140, r.top()+8, 124, 12),
+                   Qt.AlignmentFlag.AlignRight, f"Z: fixed +/-{zmax:g}")
         p.restore()
 
     def _paint_ticker(self, p, r):
@@ -1236,6 +1379,16 @@ class ScannerUI(QMainWindow):
                 pass
         self.output.append("[UI] Resuming from checkpoint...")
         self._spawn_scanner(is_resume=True)
+        # Belt-and-braces: place the emit_flag unconditionally after spawn.
+        # _spawn_scanner's own credit-grant is gated on `self._viz is not None`
+        # (line 1310-1311). On a fresh UI reopen with no viz yet, that gate is
+        # False, no flag is placed, and the scanner reaches its first chunk's
+        # emit-flag check with nothing on disk -> silently no samples. When
+        # the viz is opened later, samples never arrive and the viz stays
+        # stuck on the bootstrap loop. Calling _grant_credit() here writes the
+        # flag whether the viz is open or not; if _spawn_scanner failed,
+        # emit_flag_path handling in _grant_credit no-ops safely.
+        self._grant_credit()
 
     def _on_abort(self):
         if self.state not in (self.STATE_RUNNING, self.STATE_PAUSING):
