@@ -604,18 +604,18 @@ class _VizCanvas(QWidget):
         def Y(v): return mid - (v/zmax)*amp
         flashing = time.monotonic() < self._flash_until
         p.setPen(QPen(_VIZ_ALERT if flashing else _VIZ_TRACE, 1.4))
-        # Break the path across off-scale samples instead of clamping to
-        # rails, so we never draw a false flat line hiding zero-crossings.
-        path = QPainterPath(); pen_down = False
+        # Draw the trace CONTINUOUSLY at true Y (no pen-lifting on off-scale
+        # samples). During a wild swing an off-scale segment shoots vertically
+        # off the panel; the setClipRect(r) at the top of this method clips
+        # it to the panel edge so the visible portion still connects smoothly
+        # to the in-view samples on either side. Lifting the pen instead (an
+        # earlier version) chopped the trace into disconnected pieces every
+        # time Z left/re-entered the +/-1 window.
+        path = QPainterPath(); first = True
         for (t, v) in pts:
-            if abs(v) > zmax:
-                pen_down = False
-                continue
             xx, yy = X(t), Y(v)
-            if not pen_down:
-                path.moveTo(xx, yy); pen_down = True
-            else:
-                path.lineTo(xx, yy)
+            if first: path.moveTo(xx, yy); first = False
+            else:     path.lineTo(xx, yy)
         p.drawPath(path)
         # leading dot: solid if in-view, hollow when off-scale
         lt, lv = pts[-1]
@@ -1379,16 +1379,6 @@ class ScannerUI(QMainWindow):
                 pass
         self.output.append("[UI] Resuming from checkpoint...")
         self._spawn_scanner(is_resume=True)
-        # Belt-and-braces: place the emit_flag unconditionally after spawn.
-        # _spawn_scanner's own credit-grant is gated on `self._viz is not None`
-        # (line 1310-1311). On a fresh UI reopen with no viz yet, that gate is
-        # False, no flag is placed, and the scanner reaches its first chunk's
-        # emit-flag check with nothing on disk -> silently no samples. When
-        # the viz is opened later, samples never arrive and the viz stays
-        # stuck on the bootstrap loop. Calling _grant_credit() here writes the
-        # flag whether the viz is open or not; if _spawn_scanner failed,
-        # emit_flag_path handling in _grant_credit no-ops safely.
-        self._grant_credit()
 
     def _on_abort(self):
         if self.state not in (self.STATE_RUNNING, self.STATE_PAUSING):
